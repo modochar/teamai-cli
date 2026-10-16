@@ -41,6 +41,7 @@ vi.mock('../dashboard-collector.js', () => ({
   dashboardReport: mockDashboardReport,
   dataHomeKey: vi.fn().mockResolvedValue('key'),
   eventProjectAnchor: vi.fn().mockResolvedValue(undefined),
+  addGitStateAtStart: vi.fn().mockResolvedValue(undefined),
   // The payload's cwd: what hookScopeDir answers for a cwd that exists (#810).
   hookScopeDir: async (stdin: Record<string, unknown>) =>
     (await vi.importActual<typeof import('../utils/hook-cwd.js')>('../utils/hook-cwd.js')).resolveHookCwd(stdin),
@@ -104,6 +105,7 @@ vi.mock('../config.js', async (importOriginal) => ({
   // project config, so the gate asks the user config: the same mocked one.
   requireInit: mockAutoDetectInit,
   findUnreadableProjectConfig: mockFindUnreadableProjectConfig,
+  loadLocalConfigForScope: vi.fn().mockResolvedValue(null),
   resolveConfigForDir: vi.fn().mockResolvedValue({
     repo: { localPath: '/tmp/team-repo', remote: '' }, username: 'test', scope: 'user', additionalRoles: [],
   }),
@@ -1518,7 +1520,7 @@ describe('post-tool-use dispatch — local-agent runs detached, never blocks hos
   });
 });
 
-describe('session-start secrets hint (#875)', () => {
+describe('session-start team env hint (#875, #1018)', () => {
   let teamRepo: string;
 
   beforeEach(() => {
@@ -1562,7 +1564,38 @@ describe('session-start secrets hint (#875)', () => {
     expect(lines.filter((line) => line !== secretLines[0])).toEqual(['MR context', 'Package context']);
   });
 
-  it('adds nothing when the scope declares no secrets', async () => {
+  it('names the scope\'s env variables and env exec when it delivers variables but no secrets (#1018)', async () => {
+    fs.mkdirSync(path.join(teamRepo, 'env'));
+    fs.writeFileSync(path.join(teamRepo, 'env', 'env.yaml'), 'variables:\n  - key: API_URL\n    value: https://api.example\n');
+
+    const lines = await sessionContext();
+
+    const envLines = lines.filter((line) => line.includes('API_URL'));
+    expect(envLines).toHaveLength(1);
+    expect(envLines[0]).toContain('teamai env exec --');
+    expect(envLines[0]).not.toContain('teamai env set KEY');
+  });
+
+  it('includes inherited user variables in the hint through the shared env resolution', async () => {
+    const userRepo = path.join(teamRepo, 'user-team');
+    fs.mkdirSync(path.join(userRepo, 'env'), { recursive: true });
+    fs.writeFileSync(path.join(userRepo, 'teamai.yaml'), 'team: acme\nrepo: https://example.test/acme/team.git\n');
+    fs.writeFileSync(path.join(userRepo, 'env', 'env.yaml'), 'variables:\n  - key: USER_ONLY\n    value: inherited\n');
+    const { loadLocalConfigForScope } = await import('../config.js');
+    vi.mocked(loadLocalConfigForScope).mockResolvedValueOnce({
+      ...scope, scope: 'user', repo: { localPath: userRepo, remote: '' },
+    });
+    const projectConfig: LocalConfig = {
+      ...scope, scope: 'project', inheritUserScope: true, projectRoot: teamRepo, repo: { localPath: teamRepo, remote: '' },
+    };
+    const dispatcher = createDispatcher({ handlers: filterHandlersForConfig(buildHandlerRegistry(), projectConfig), localConfig: projectConfig });
+    const result = await dispatcher.dispatch('session-start', '*', { session_id: 'sid-inherited', cwd: teamRepo }, 'claude', 'foreground');
+
+    expect(result.errors).toEqual([]);
+    expect(result.output).toContain('Team env variables in this scope: USER_ONLY.');
+  });
+
+  it('adds nothing when the scope delivers no env', async () => {
     expect(await sessionContext()).toEqual(['MR context', 'Package context']);
   });
 
@@ -1574,10 +1607,10 @@ describe('session-start secrets hint (#875)', () => {
   });
 
   it('is a foreground team handler, so a directory without teamai never gets the line', () => {
-    const registration = buildHandlerRegistry().find((r) => r.handler.name === 'secrets-hint');
+    const registration = buildHandlerRegistry().find((r) => r.handler.name === 'team-env-hint');
     expect(registration).toMatchObject({ event: 'session-start', matcher: '*', requiresConfig: true });
     expect(registration?.background).not.toBe(true);
-    expect(filterHandlersForConfig(buildHandlerRegistry(), null).map((r) => r.handler.name)).not.toContain('secrets-hint');
+    expect(filterHandlersForConfig(buildHandlerRegistry(), null).map((r) => r.handler.name)).not.toContain('team-env-hint');
   });
 });
 
@@ -1935,6 +1968,28 @@ describe('track-slash handler: dotted and colon skill names', () => {
     expect(vi.mocked(appendUsageEvent).mock.calls[0][0].skill).toBe('ns:deploy');
     expect(updateKnownSkills).toHaveBeenCalledWith('ns:deploy');
   });
+
+  it.each([
+    '/Volumes/External/project/.claude/skills/tdd/SKILL.md',
+    '/Users/alice/project',
+    '/tmp/project',
+    '/tdd/notes',
+    '/tdd\\notes',
+    '//server/share',
+    '/tdd+invalid',
+  ])('does not record a path or a partial skill name: %s', async (prompt) => {
+    const { appendUsageEvent, updateKnownSkills } = await import('../usage-tracker.js');
+    const handler = buildHandlerRegistry().find(
+      (r) => r.event === 'prompt-submit' && r.handler.name === 'track-slash',
+    )!.handler;
+    vi.mocked(appendUsageEvent).mockClear();
+    vi.mocked(updateKnownSkills).mockClear();
+
+    await handler.execute({ prompt, hook_event_name: 'UserPromptSubmit' }, 'claude', scope);
+
+    expect(appendUsageEvent).not.toHaveBeenCalled();
+    expect(updateKnownSkills).not.toHaveBeenCalled();
+  });
 });
 
 describe('buildAdoptedSummary', () => {
@@ -1963,7 +2018,10 @@ describe('mr-hint agent language (#1014)', () => {
         ...scope,
         repo: { localPath: dir, remote: 'https://example.invalid/t.git' },
       });
-      expect(mockMrHintOutput).toHaveBeenCalledWith('en');
+      expect(mockMrHintOutput.mock.calls.at(-1)).toEqual([
+        'en',
+        expect.objectContaining({ repo: expect.objectContaining({ localPath: dir }) }),
+      ]);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -1982,7 +2040,10 @@ describe('mr-hint agent language (#1014)', () => {
         ...scope,
         repo: { localPath: dir, remote: 'https://example.invalid/t.git' },
       });
-      expect(mockMrHintOutput.mock.calls.at(-1)).toEqual([undefined]);
+      expect(mockMrHintOutput.mock.calls.at(-1)).toEqual([
+        undefined,
+        expect.objectContaining({ repo: expect.objectContaining({ localPath: dir }) }),
+      ]);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }

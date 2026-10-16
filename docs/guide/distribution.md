@@ -21,7 +21,7 @@ The team's assets live in their own repo. This project points at it.
 This project:
 
 ```bash
-cd /path/to/my-project
+cd /path/to/my-workspace
 teamai init https://github.com/your-org/platform-teamai
 ```
 
@@ -44,9 +44,18 @@ teamai init https://github.com/your-org/java-service-teamai --inherit-user-scope
 This repo is the team repo. Assets go in `.teamai/`.
 
 ```bash
-cd /path/to/my-project
+cd /path/to/my-workspace
 teamai init . --agent claude,cursor
 ```
+
+### Workspaces with repos inside
+
+A workspace also delivers what the set-up repos under it select.
+`teamai pull` in `ws/` finds them up to three folders down and names them.
+It stops at a repo: folders and worktrees inside `svc-a/` belong to `svc-a`.
+A skill, agent, hook, env key or MCP server two repos ship the same way arrives once; one that differs is held and named, and each repo keeps its own.
+A child with another team repo is left out, with a line that says so.
+Your agent in `svc-a/` still gets only `svc-a`'s resources.
 
 ## Repo
 
@@ -93,11 +102,11 @@ submodules: true
 
 `teamai.yaml` can name Node scripts. The CLI runs each one with its own Node, not a shell. `path` is relative to the team repo root and must stay inside that repo. A symlink that leaves the repo is rejected. The script's working directory is the team repo. A failure does not fail init or pull.
 
-In project scope the script also receives the checkout TeamAI already resolved. The script decides what to write. TeamAI does not manage personal files, and it does not replace a file the script chooses to keep.
+In workspace scope the script also receives the checkout TeamAI already resolved. The script decides what to write. TeamAI does not manage personal files, and it does not replace a file the script chooses to keep.
 
 - `TEAMAI_REPO` — the team repo
-- `TEAMAI_SCOPE` — `user` or `project`
-- `TEAMAI_CHECKOUT` — this checkout, in project scope
+- `TEAMAI_SCOPE` — `user`, or `project` for the workspace scope
+- `TEAMAI_CHECKOUT` — this checkout, in workspace scope
 - `TEAMAI_MAIN_CHECKOUT` — the main checkout TeamAI resolved, when it knows one
 - `TEAMAI_PROJECT` — that same resolved identity, stable across worktrees of one repo
 
@@ -167,6 +176,21 @@ teamai roles set frontend
 teamai projects set checkout
 teamai pull
 ```
+
+## Restricting skills to some members
+
+Namespaces only filter for members who have set a role: a member with no `primaryRole` syncs everything, so `manifest/roles.yaml` alone restricts no one. `teamai init` makes new members pick a role; members from before the manifest need `teamai roles set <role-id>` once. Their next pull withdraws teamai-delivered copies outside the new namespaces (locally modified copies are kept).
+
+To remind members who never set a role, enforce a rule that asks the agent to check `teamai roles list` and prompt them — enforced rules cannot be deleted:
+
+```yaml
+# teamai.yaml
+sharing:
+  rules:
+    enforced: [set-your-role]
+```
+
+Tags never restrict: a subscription only adds matching tagged skills. Restrict with namespaces + roles; use tags for opt-in extras.
 
 ## Tags
 

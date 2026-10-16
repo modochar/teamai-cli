@@ -75,7 +75,15 @@ teamai recall status
 
 本机覆盖写在 `~/.teamai/config.yaml` 的 `recallEnabled`。`TEAMAI_RECALL_DISABLED=1` 强制关掉。关掉之后 pull 不再安装 recall；直接运行 `teamai recall` 仍然可以搜。
 
-关闭 recall 不会隐藏 SessionStart 的近期已合入 MR 提示。这条提示指向 `teamai import --from-mr`，团队在开启 recall 前也可以先提炼并发布 learning。要单独关闭这条提示，设置 `TEAMAI_MR_HINT_DISABLED=1`。
+关闭 recall 不会隐藏 SessionStart 的近期已合入 MR 提示。这条提示指向 `teamai import --from-mr`，团队在开启 recall 前也可以先提炼并发布 learning。它有自己的开关，关闭它不会影响 `contributeHint`：
+
+```yaml
+sharing:
+  mrHint:
+    enabled: false
+```
+
+单机可在 `~/.teamai/config.yaml` 里设置 `mrHintEnabled: false`，或设置 `TEAMAI_MR_HINT_DISABLED=1`。
 
 `teamai.yaml` 的 `language` 可以是 `en` 或 `zh`。`en` 时，内置 recall 规则、TodoWrite 提示和已合入 MR 提示只用英文。不写或写 `zh`，保持中英双语。下一次 `teamai pull` 按这个重写。
 
@@ -101,28 +109,35 @@ teamai recall promote <learningId> --dry-run
 
 ## 代码知识图谱
 
-`teamai import` 把源码仓库写成团队仓库里的 `teamwiki/`，`teamai recall` 会一起搜。
+`teamai import` 把源码仓库写成团队仓库里的 `teamwiki/`，`teamai recall` 会一起搜。所有来源都写进同一个位置：`<团队仓库>/teamwiki/evidence/code/<slug>/`，源码目录本身不会多出 `teamwiki/`。
 
 ```bash
 teamai import --dir /path/to/project
+teamai import --dir /path/to/project --incremental
 teamai import --from-repo https://github.com/org/repo
 teamai import --from-org myorg
 teamai import --from-repo-list repos.yaml
 teamai import --from-mr https://github.com/org/repo/pull/123
+teamai import --from-mr https://github.com/org/repo/pull/123 https://github.com/org/repo/pull/124
 teamai import --from-repo https://github.com/org/repo --incremental
 teamai import --from-repo https://github.com/org/repo --skip-enrich
 ```
 
-已经提过一次之后，用 `teamai codebase` 刷新和检查：
+`--from-mr` 可以一次传多个 MR URL：每个草稿照旧单独确认（`--all` 则都不问），接受的 learning 在最后一次性发布，每个仓库的 teamwiki 只更新一次。其中一个 MR 失败不影响其余，运行结束时给出汇总，有失败则退出码非零。
+
+`--incremental` 只重新提取上次导入后改过的文件，基线随每个代码库存在它自己的 `evidence/code/<slug>/` 里。远端仓库的 slug 是 `<provider>__<owner>__<repo>`，`--from-repo`、`--from-mr` 和 `teamai ci extract-mr` 用的都是它；`--dir` 用仓库名。
+
+导入之后，用 `teamai codebase` 检查和加工同一份 `teamwiki/`：
 
 ```bash
-teamai codebase --extract /path/to/repo --project my-service
-teamai codebase --extract /path/to/repo --project my-service --incremental
-teamai codebase --deep-enrich --project my-service --output /path/to/repo
-teamai codebase --lint --output /path/to/repo
+teamai codebase --status
+teamai codebase --deep-enrich --project <slug>
+teamai codebase --lint
 ```
 
-`--output` 指向仓库根目录。`--project` 的值会成为 `teamwiki/evidence/code/<slug>/`。
+没有团队仓库时，给 `teamai import` 和 `teamai codebase` 都加上 `--output <dir>`，两者都用 `<dir>/teamwiki/`。
+
+`teamai codebase --extract` 已移除，改用 `teamai import --dir`。
 
 recall 结果里的 `Source freshness:`：`current` 是内容和上次扫描一致，`stale` 是变了，`missing` 是文件不在了，`unknown` 是对不上。`current` 也不代表文档本身正确。
 
@@ -144,8 +159,10 @@ projects:
 
 ```bash
 teamai ci extract-mr --url "$MR_URL" --mode comment --individual-comments
-teamai ci extract-mr --url "$MR_URL" --mode write --team-repo ./team-repo --individual-comments
+teamai ci extract-mr --url "$MR_URL" --mode write --team-repo ../team-repo --individual-comments
 ```
+
+write 模式在合并后的源码 checkout 里运行，代码知识走和 `teamai import --dir . --incremental` 相同的流程，写进 `<team-repo>/teamwiki/evidence/code/<provider>__<owner>__<repo>/`，只重新提取改过的文件。团队仓库要克隆在 checkout 之外，否则它的文件会被当成源码提取，这一步会被跳过。
 
 不要的建议打上拒绝标记：GitHub 用 👎，工蜂用 ☝️。模板在 [`examples/ci/`](../../../examples/ci/README.md)。
 

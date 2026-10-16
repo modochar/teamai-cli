@@ -21,7 +21,7 @@
 只进当前项目：
 
 ```bash
-cd /path/to/my-project
+cd /path/to/my-workspace
 teamai init https://github.com/your-org/platform-teamai
 ```
 
@@ -44,9 +44,18 @@ teamai init https://github.com/your-org/java-service-teamai --inherit-user-scope
 业务仓库自己就是团队仓库。资产写在这个仓库的 `.teamai/` 里。
 
 ```bash
-cd /path/to/my-project
+cd /path/to/my-workspace
 teamai init . --agent claude,cursor
 ```
+
+### 包含仓库的 workspace
+
+workspace 也会交付其下已初始化的仓库所选择的资源。
+在 `ws/` 中运行 `teamai pull` 会查找最多三层目录以内的这些仓库，并列出它们的名字。
+它在仓库处停止：`svc-a/` 里的文件夹和 worktree 属于 `svc-a`。
+两个仓库以相同方式提供的 skill、agent、hook、env 键或 MCP server 只送达一次；内容不同的会被暂缓（held）并指出名字，每个仓库保留自己的那一份。
+使用其他团队仓库的子项会被排除，并有一行说明。
+你在 `svc-a/` 中的 agent 仍然只获得 `svc-a` 的资源。
 
 ## 仓库
 
@@ -93,11 +102,11 @@ submodules: true
 
 `teamai.yaml` 可以声明 Node 脚本。CLI 用自己的 Node 跑，不经过 shell。`path` 相对团队仓库根目录，而且必须留在仓库里。指向仓库外的符号链接会被拒绝。脚本的工作目录是团队仓库。脚本失败不会让 init 或 pull 失败。
 
-项目 scope 下，脚本还会拿到 TeamAI 已经解析好的检出目录。写什么由脚本决定。TeamAI 不管理个人文件，也不会替脚本覆盖它打算保留的文件。
+workspace scope 下，脚本还会拿到 TeamAI 已经解析好的检出目录。写什么由脚本决定。TeamAI 不管理个人文件，也不会替脚本覆盖它打算保留的文件。
 
 - `TEAMAI_REPO` — 团队仓库
-- `TEAMAI_SCOPE` — `user` 或 `project`
-- `TEAMAI_CHECKOUT` — 当前检出目录，仅项目 scope
+- `TEAMAI_SCOPE` — `user`，workspace scope 下为 `project`
+- `TEAMAI_CHECKOUT` — 当前检出目录，仅 workspace scope
 - `TEAMAI_MAIN_CHECKOUT` — TeamAI 解析到的主检出目录，知道时才有
 - `TEAMAI_PROJECT` — 同一个解析结果，同一仓库的各个 worktree 都一样
 
@@ -167,6 +176,21 @@ teamai roles set frontend
 teamai projects set checkout
 teamai pull
 ```
+
+## 把技能限定给部分成员
+
+Namespace 只对设置了角色的成员过滤：`primaryRole` 未设置的成员会同步全部技能，因此只有 `manifest/roles.yaml` 并不限定任何人。`teamai init` 会让新成员选择角色；manifest 之前入队的成员需要执行一次 `teamai roles set <role-id>`。之后的 pull 会收回新 namespace 之外、由 teamai 下发的副本（本地改过的保留）。
+
+要提醒一直没设角色的成员，可以用强制规则让 agent 检查 `teamai roles list` 并催促设置——强制规则成员不可删除：
+
+```yaml
+# teamai.yaml
+sharing:
+  rules:
+    enforced: [set-your-role]
+```
+
+标签从不做限定：订阅只会额外拉取匹配标签的技能。限定用 namespace + 角色，标签用于自愿加法。
 
 ## 标签
 

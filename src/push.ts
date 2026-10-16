@@ -4,7 +4,7 @@ import YAML from 'yaml';
 import { autoDetectInit, loadStateForScope, saveStateForScope } from './config.js';
 import { assertNotReadOnly } from './read-only.js';
 import {
-  createGit, pullRepo, pushRepoBranch, checkoutMaster, generateBranchName,
+  createGit, pullRepo, pushRepoBranch, checkoutMaster, generateBranchName, unusedBranchName,
   resetToCleanMaster, isDedicatedRepoRoot, getDefaultBranch, getFileContentAtRev, getHeadCommit,
 } from './utils/git.js';
 import { reconcilePlacementRecords, dropClosedPendingPushes,
@@ -14,6 +14,7 @@ import { reconcilePlacementRecords, dropClosedPendingPushes,
 import { syncTeamUpdatesToLocal } from './utils/pre-push-sync.js';
 import { getProvider } from './providers/index.js';
 import { log, spinner } from './utils/logger.js';
+import { getUserHome } from './utils/home.js';
 import { getHandler } from './resources/index.js';
 import { createSkillPushItem, scanTeamRepoNamespaces } from './resources/skills.js';
 import { AgentsHandler } from './resources/agents.js';
@@ -346,6 +347,7 @@ async function createPrWithFallback(
   branchName: string,
   title: string,
   description: string,
+  opts: { spawnTimeoutMs?: number } = {},
 ): Promise<string | null> {
   // A member's `init --provider` choice outranks the team's provider (#789).
   const provider = getProvider(localConfig.provider ?? teamConfig.provider);
@@ -369,6 +371,7 @@ async function createPrWithFallback(
       description,
       reviewers: teamConfig.reviewers?.length ? teamConfig.reviewers : undefined,
       cwd: localConfig.repo.localPath,
+      spawnTimeoutMs: opts.spawnTimeoutMs,
     });
     mrSpin.succeed(`Pull Request created: ${prUrl}`);
     return prUrl;
@@ -733,11 +736,15 @@ async function pushGroup(args: {
     // sources / publicSkills changes ride along in the same PR as the resources.
     const configFiles = includeTeamConfig ? ['teamai.yaml'] : [];
     const gitFiles = [...new Set([...pushedFiles, ...existingSweepers, ...configFiles])];
-    const branchName = reuse?.branch ?? branch ?? generateBranchName(localConfig.username);
     const commitMsg = `[teamai] Push ${items.length} resource(s) from ${localConfig.username}`;
-    // The default-branch commit the branch is built on, which bounds the
-    // history that can prove a placement landed (`reconcilePlacementRecords`).
-    const base = await getHeadCommit(localConfig.repo.localPath) ?? undefined;
+    // Two independent reads. `base` is the default-branch commit the branch is
+    // built on, which bounds the history that can prove a placement landed
+    // (`reconcilePlacementRecords`).
+    const [branchName, headCommit] = await Promise.all([
+      reuse?.branch ?? branch ?? unusedBranchName(localConfig.repo.localPath, localConfig.username),
+      getHeadCommit(localConfig.repo.localPath),
+    ]);
+    const base = headCommit ?? undefined;
 
     const hasChanges = await pushRepoBranch(
       localConfig.repo.localPath,
@@ -847,6 +854,28 @@ async function pushGroup(args: {
   }
 }
 
+/**
+ * The `--skill` path as given (`~` expanded, made absolute), and the skill
+ * directory it resolves to.
+ *
+ * `~` goes through `getUserHome()` like every other home-relative path, so
+ * `push --skill ~/...` reads the same home the scan and the credentials use.
+ */
+function resolveRequestedSkill(skill: string): { requestedPath: string; skillPath: string } {
+  const requestedPath = skill.startsWith('~') ? path.join(getUserHome(), skill.slice(1)) : path.resolve(skill);
+  return { requestedPath, skillPath: resolveReal(requestedPath) };
+}
+
+/** Validate workflows without failing this push when one file is invalid. */
+async function validateWorkflows(localConfig: LocalConfig, dryRun: boolean): Promise<void> {
+  try {
+    const { syncWorkflowDefinitions } = await import('./workflow/cache.js');
+    await syncWorkflowDefinitions(localConfig, { dryRun, scopeLabel: localConfig.scope });
+  } catch (error) {
+    log.warn(`Workflows were not updated: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
 export async function push(
   options: GlobalOptions & { all?: boolean; role?: string; project?: string; branch?: string },
   /**
@@ -859,6 +888,8 @@ export async function push(
 ): Promise<void> {
   // Auto-detect scope: project scope if cwd has project config, else user scope.
   // An unreadable project config stops here instead of selecting another team.
+  // A workspace sends an edit back where it came from, a child's namespace
+  // included; a new item still goes to its own selection (#913).
   const { localConfig, teamConfig } = await autoDetectInit(undefined, { dryRun: options.dryRun });
   assertNotReadOnly(localConfig, 'teamai push');
 
@@ -918,6 +949,7 @@ export async function push(
       return;
     }
     try {
+      await validateWorkflows(localConfig, !!options.dryRun);
       // Self-heal an older .teamai/.gitignore that still ignores `env` (pre-beta.5).
       // Run against the ACTIVE tree (original localConfig, projectRoot intact) BEFORE
       // swapping into the worktree, so the fixed .gitignore lets env changes surface.
@@ -974,6 +1006,7 @@ export async function push(
     return;
   }
   try {
+    await validateWorkflows(localConfig, !!options.dryRun);
     await pushCore(localConfig, teamConfig, options, null, result);
   } finally {
     await releaseLock(syncLock);
@@ -1069,11 +1102,17 @@ async function pushCore(
       }
       const yamlPath = path.join(repoPath, 'teamai.yaml');
       const workingContent = await readFileSafe(yamlPath);
-      if (workingContent !== null) {
-        const committed = await getFileContentAtRev(repoPath, 'HEAD', 'teamai.yaml');
-        if (committed === null || committed.toString() !== workingContent) {
-          pendingTeamConfig = workingContent;
-        }
+      // Nothing below writes before these reads finish, so they run together:
+      // the env scan, the clone's status, and what HEAD holds of teamai.yaml.
+      const envScan = getHandler('env').scanLocalForPush(teamConfig, localConfig);
+      // Awaited after the status: a status failure is the one reported, as before.
+      envScan.catch(() => {});
+      const [committed, status] = await Promise.all([
+        workingContent === null ? null : getFileContentAtRev(repoPath, 'HEAD', 'teamai.yaml'),
+        git.status(),
+      ]);
+      if (workingContent !== null && (committed === null || committed.toString() !== workingContent)) {
+        pendingTeamConfig = workingContent;
       }
       const modeChangedPaths = new Set<string>();
       if (pendingTeamConfig !== null && await hasGitModeChange(git, 'teamai.yaml')) {
@@ -1085,7 +1124,6 @@ async function pushCore(
       // stays dirty and stops the push. So does any index state: the snapshot
       // holds only the working copy, and reset --hard would drop a staged,
       // conflicted, deleted or renamed entry.
-      const status = await git.status();
       const indexedPaths = new Set(collectDirtyPaths({
         staged: status.staged,
         created: status.created,
@@ -1093,7 +1131,7 @@ async function pushCore(
         deleted: status.deleted,
         renamed: status.renamed,
       }));
-      for (const item of await getHandler('env').scanLocalForPush(teamConfig, localConfig)) {
+      for (const item of await envScan) {
         if (indexedPaths.has(item.relativePath)) continue;
         const snapshot = await readFileSnapshot(item.sourcePath);
         if (snapshot !== null && !await hasGitModeChange(git, item.relativePath)) {
@@ -1366,6 +1404,9 @@ async function pushCore(
   const recordedPushes = pushState.pendingPushes ?? [];
   const openPushes = await dropClosedPendingPushes(localConfig.repo.localPath, recordedPushes);
 
+  // The copy `--skill` names. The skills scan leaves its outcome to --skill below.
+  const requestedSkill = options.skill ? resolveRequestedSkill(options.skill) : undefined;
+
   for (const type of pushableTypes) {
     const handler = getHandler(type);
     try {
@@ -1373,7 +1414,9 @@ async function pushCore(
         scanTeamConfig,
         localConfig,
         type === 'agents' ? { namespace: requestedAgentsNamespace }
-          : type === 'skills' ? { pending: openPushes, namespace: requestedSkillsNamespace } : undefined,
+          : type === 'skills'
+            ? { pending: openPushes, namespace: requestedSkillsNamespace, requestedSkillPath: requestedSkill?.skillPath }
+            : undefined,
       );
       fullScan.push(...items);
     } catch (e) {
@@ -1442,16 +1485,11 @@ async function pushCore(
   spin.stop();
 
   // ── Handle --skill parameter: filter to a single specific skill ──────
-  if (options.skill) {
-    // Normalize the input path (expand ~ and resolve to absolute). Messages
-    // name it as given; the skill is the directory a symlink points to, and is
-    // named after that directory. Validate that name: it defends against path
-    // traversal, URL-encoded bypasses, and other illegal characters.
-    const os = await import('node:os');
-    const requestedPath = options.skill.startsWith('~')
-      ? path.join(os.homedir(), options.skill.slice(1))
-      : path.resolve(options.skill);
-    const skillPath = resolveReal(requestedPath);
+  if (requestedSkill) {
+    // Messages name the path as given; the skill is the directory a symlink
+    // points to, and is named after that directory. Validate that name: it
+    // defends against path traversal, URL-encoded bypasses, and other illegal characters.
+    const { requestedPath, skillPath } = requestedSkill;
     try {
       assertSafeResourceName(path.basename(skillPath));
     } catch (e) {
@@ -1460,19 +1498,12 @@ async function pushCore(
       return;
     }
 
-    // Try to find matching skill from scan results first
-    let matchedItem: ResourceItem | undefined;
-
-    for (const item of allItems) {
-      if (item.type !== 'skills') continue;
-
-      // --skill selects this copy only. A same-named item from another tool
-      // cannot stand in for a requested copy the scan skipped.
-      if (resolveReal(item.sourcePath) === skillPath) {
-        matchedItem = item;
-        break;
-      }
-    }
+    // Try to find matching skill from scan results first. --skill selects this
+    // copy only: a same-named item from another tool cannot stand in for a
+    // requested copy the scan skipped. One copy a workspace delivered for
+    // several team skills is an item for each (#913).
+    const matchedItems = allItems.filter((item) => item.type === 'skills' && resolveReal(item.sourcePath) === skillPath);
+    let matchedItem: ResourceItem | undefined = matchedItems[0];
 
     // If not found in scan results, force-construct a ResourceItem from the
     // specified path. This handles cases where:
@@ -1568,7 +1599,7 @@ async function pushCore(
 
     // Replace allItems with just this one skill
     allItems.length = 0;
-    allItems.push(matchedItem);
+    allItems.push(...matchedItems.length > 0 ? matchedItems : [matchedItem]);
 
     // A force-constructed matchedItem (scanner returned nothing for this skill
     // because its content matches the team repo) is absent from fullScan. Add it

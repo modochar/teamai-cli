@@ -48,6 +48,7 @@ import {
   type LocalConfig,
   type Scope,
   type ManagedMcpManifest,
+  installScopeName,
 } from './types.js';
 import { BUILTIN_RULE_NAMES, TEAMAI_CONTEXT_RULE_NAME } from './builtin-rules.js';
 import { isLegacyCursorRuleFile, keptLegacyCopiesWarning, ruleStemFromFilename, usesMdcRules, type InstructionBlock, type LegacyRuleDir } from './resources/rule-format.js';
@@ -93,7 +94,7 @@ import { askConfirmation } from './utils/prompt.js';
 import { getUserHome } from './utils/home.js';
 import { gitCommonDir, listWorktrees } from './utils/git.js';
 import {
-  detectShellProfile,
+  envLoaderProfiles,
   findEnvBlockFor,
   SHELL_PROFILE_CANDIDATE_NAMES,
 } from './utils/shell-profile.js';
@@ -150,6 +151,10 @@ interface RemovalPlan {
   mcpServers: string[];
   /** Shell profile paths carrying a teamai env block (usually one, but see #682/#693). */
   shellProfiles: string[];
+  /** The project scope to take out of the env loader's registry (#1018); null for the user scope. */
+  envScope: LocalConfig | null;
+  /** Whether no other scope needs the env loader, so its profile block, script and registry go too. */
+  shouldRemoveEnvLoader: boolean;
   /** Docs directory (null if doesn't exist). */
   docsDir: string | null;
   /** The team clone, whose history proves a doc in `docsDir` teamai's (#993). */
@@ -735,28 +740,35 @@ interface KeptProject { dataHome: string; name: string }
 interface KeptForProjects { projects: KeptProject[]; paths: string[] }
 
 /**
- * What a user-scope uninstall leaves under ~/.teamai for the projects still
- * set up on this machine (#1025), so `teamai uninstall` in each still finds
- * its config and removes what it installed: each partition holding a config,
- * and the shared files those projects' own pull, uninstall and doctor read.
+ * What a user-scope uninstall, or one that finds no configuration, leaves
+ * under ~/.teamai for the projects still set up on this machine (#1025), so
+ * `teamai uninstall` in each still finds its config and removes what it
+ * installed: each partition holding a config or registered with the env
+ * loader (#1018), and the shared files those projects' own pull, uninstall,
+ * doctor and shells read.
  * A shared file goes only when no kept project can need it: a config that
  * does not parse still makes a project (as in rules.ts), and one whose team
  * checkouts cannot all be known keeps every shared file it could need.
  */
 async function keptForProjects(): Promise<KeptForProjects> {
   const { projectsRootDir, readAnchorFile } = await import('./utils/partition.js');
+  const { envLoaderFilesForProjects } = await import('./resources/env-loader.js');
+  // A project the env loader still routes shells to keeps its env.sh, the loader and the registry (#1018).
+  const envLoader = await envLoaderFilesForProjects();
   const projects: KeptProject[] = [];
   const readers: Array<LocalConfig[] | null> = [];
-  for (const dir of await listDirs(projectsRootDir())) {
-    const dataHome = path.join(projectsRootDir(), dir);
-    if (!await pathExists(path.join(dataHome, 'config.yaml'))) continue;
+  const partitions = (await listDirs(projectsRootDir())).map((dir) => path.join(projectsRootDir(), dir));
+  for (const dataHome of new Set([...partitions, ...envLoader.partitions])) {
+    const hasConfig = await pathExists(path.join(dataHome, 'config.yaml'));
+    if (!hasConfig && !(envLoader.partitions.includes(dataHome) && await pathExists(dataHome))) continue;
     const anchor = await readAnchorFile(dataHome);
     const hasCheckout = !!anchor && await pathExists(anchor);
     // No checkout to run `teamai uninstall` in: the member deletes it, never this guess.
     projects.push({ dataHome, name: hasCheckout ? anchor : `${dataHome} (checkout ${anchor ?? 'unknown'} missing: delete it by hand)` });
-    readers.push(await teamReadersOf(dataHome, anchor));
+    // One with no config reads no team's shared files.
+    if (hasConfig) readers.push(await teamReadersOf(dataHome, anchor));
   }
-  if (projects.length === 0) return { projects, paths: [] };
+  if (projects.length === 0) return { projects, paths: envLoader.files };
   const shared = [
     getUserManagedHooksPath(),
     codexTeamHookIndexPath(),
@@ -765,7 +777,19 @@ async function keptForProjects(): Promise<KeptForProjects> {
   ];
   const present = [];
   for (const file of shared) if (await pathExists(file)) present.push(file);
-  return { projects, paths: [...projects.map((project) => project.dataHome), ...present] };
+  return { projects, paths: [...envLoader.files, ...projects.map((project) => project.dataHome), ...present] };
+}
+
+/** Name the projects a removal of ~/.teamai keeps, and the shared files kept for them. */
+function printKeptForProjects({ projects, paths }: KeptForProjects): void {
+  if (projects.length === 0) return;
+  console.log('   Kept for the projects still set up on this machine (run `teamai uninstall` in each):');
+  for (const { name } of projects) console.log(`     ${name}`);
+  const dataHomes = new Set(projects.map(({ dataHome }) => dataHome));
+  const shared = paths.filter((kept) => !dataHomes.has(kept));
+  if (shared.length > 0) console.log('   and the shared files they read:');
+  for (const file of shared) console.log(`     ${file}`);
+  console.log('');
 }
 
 /**
@@ -1182,6 +1206,8 @@ async function buildRemovalPlan(
     agentFiles: [],
     mcpServers: [],
     shellProfiles: [],
+    envScope: null,
+    shouldRemoveEnvLoader: false,
     docsDir: null,
     teamRepoPath: localConfig.repo.localPath,
     gitExcludes: new Map(),
@@ -1335,18 +1361,22 @@ async function buildRemovalPlan(
     // load" check: a legacy block written by a pre-#661/#682 CLI (raw
     // backslashes, or the MSYS drive form) still belongs to this scope and
     // still has to be found and removed, even though it never worked.
-    const configuredProfilePath = teamConfig.sharing.env.shellProfilePath
-      ? expandHome(teamConfig.sharing.env.shellProfilePath)
-      : await detectShellProfile();
+    // One loader block serves every scope (#1018): it goes with the last one.
+    const { envLoaderPath, isLastEnvScope } = await import('./resources/env-loader.js');
+    const override = teamConfig.sharing.env.shellProfilePath;
     const home = getUserHome();
     const envShPath = path.join(getDataHome(localConfig), 'env.sh');
     const candidateProfilePaths = Array.from(new Set([
-      configuredProfilePath,
+      ...(await envLoaderProfiles(override, envLoaderPath())).paths,
+      ...override ? [expandHome(override)] : [],
       ...SHELL_PROFILE_CANDIDATE_NAMES.map((name) => path.join(home, name)),
     ]));
+    plan.envScope = localConfig;
+    plan.shouldRemoveEnvLoader = await isLastEnvScope(localConfig);
     for (const candidate of candidateProfilePaths) {
       const profileContent = await readFileSafe(candidate);
-      if (profileContent && findEnvBlockFor(profileContent, envShPath)) {
+      if (profileContent && (findEnvBlockFor(profileContent, envShPath)
+        || (plan.shouldRemoveEnvLoader && findEnvBlockFor(profileContent, envLoaderPath())))) {
         plan.shellProfiles.push(candidate);
       }
     }
@@ -1389,8 +1419,8 @@ async function buildRemovalPlan(
       if (localConfig.projectRoot) {
         const { removeGitHook } = await import('./git-hook.js');
         const checkouts: string[] = [];
-        let entries: string[] = [];
         const seen = new Set<string>();
+        const entries = new Set<string>();
         for (const root of plan.checkouts) {
           const common = await gitCommonDir(root);
           if (!common || seen.has(common)) continue;
@@ -1398,9 +1428,9 @@ async function buildRemovalPlan(
           const owned = await removeGitHook(root, { dryRun: true }).catch(() => []);
           if (owned.length === 0) continue;
           checkouts.push(root);
-          entries = [...new Set([...entries, ...owned])];
+          for (const entry of owned) entries.add(entry);
         }
-        if (checkouts.length > 0) plan.gitHook = { repoDir: checkouts[0], entries, checkouts };
+        if (checkouts.length > 0) plan.gitHook = { repoDir: checkouts[0], entries: [...entries], checkouts };
       }
     }
   }
@@ -1438,7 +1468,7 @@ function isPlanEmpty(plan: RemovalPlan): boolean {
 
 function printSummary(plan: RemovalPlan, agentFilter?: string): void {
   console.log('');
-  console.log(`⚠  Uninstalling ${plan.scope} scope — ${plan.teamaiHome}`);
+  console.log(`⚠  Uninstalling ${installScopeName(plan.scope)} scope — ${plan.teamaiHome}`);
   if (agentFilter) {
     const sharedNote = plan.includeShared
       ? ' (last tool — shared resources removed too)'
@@ -1583,15 +1613,7 @@ function printSummary(plan: RemovalPlan, agentFilter?: string): void {
     console.log('');
   }
 
-  if (plan.teamaiHomeExists && plan.keptForProjects.projects.length > 0) {
-    console.log('   Kept for the projects still set up on this machine (run `teamai uninstall` in each):');
-    for (const { name } of plan.keptForProjects.projects) console.log(`     ${name}`);
-    const dataHomes = plan.keptForProjects.projects.map(({ dataHome }) => dataHome);
-    const shared = plan.keptForProjects.paths.filter((kept) => !dataHomes.includes(kept));
-    if (shared.length > 0) console.log('   and the shared files they read:');
-    for (const file of shared) console.log(`     ${file}`);
-    console.log('');
-  }
+  if (plan.teamaiHomeExists) printKeptForProjects(plan.keptForProjects);
 
   if (plan.unpublishedQueues.length > 0) {
     console.log('⚠  Learnings not published yet, deleted with the home directory:');
@@ -1920,8 +1942,8 @@ async function dropToolGitExcludePaths(
   const codexShared = (id: string): string[] => id === CODEX_TOOL ? [SHARED_AGENT_SKILLS_PATH] : [];
   // The tool's roots (`.claude`, `.github`), less what another tool in use reads there (WorkBuddy's `.codebuddy/rules`).
   const roots = [...new Set([...pathsOf(tool).map(toolInstallRoot), ...codexShared(tool)])];
-  const others = Object.keys(toolPaths).filter((id) => id !== tool && !isAgentExcluded(localConfig, id))
-    .flatMap((id) => [...pathsOf(id), ...codexShared(id)]);
+  const others = Object.keys(toolPaths).flatMap((id) =>
+    id === tool || isAgentExcluded(localConfig, id) ? [] : [...pathsOf(id), ...codexShared(id)]);
   const state = await loadStateForScope(localConfig);
   const records = state.lastPullByWorkspace ?? {};
   const checkouts = [...new Set([await realpath(projectRoot).catch(() => projectRoot), ...Object.values(records).flatMap(({ root }) => root ? [root] : [])])];
@@ -2092,7 +2114,7 @@ async function executeRemoval(
         }
       }
     } catch (e) {
-      log.warn(`Failed to remove OpenCode hook (${scope} scope): ${(e as Error).message}`);
+      log.warn(`Failed to remove OpenCode hook (${installScopeName(scope)} scope): ${(e as Error).message}`);
     }
   }
 
@@ -2264,22 +2286,29 @@ async function executeRemoval(
   // buildRemovalPlan, not just the one detectShellProfile() resolves to today.
   // Only this scope's own block: another scope's may share the file (#876).
   const envShPath = path.join(plan.teamaiHome, 'env.sh');
+  const { envLoaderPath, removeEnvLoader, unregisterEnvScope } = await import('./resources/env-loader.js');
+  const owned = plan.shouldRemoveEnvLoader ? [envShPath, envLoaderPath()] : [envShPath];
   for (const profilePath of plan.shellProfiles) {
     try {
-      const content = await readFileSafe(profilePath);
-      if (content) {
-        const block = findEnvBlockFor(content, envShPath);
-        if (block && block.end !== null) {
-          const before = content.substring(0, block.start).replace(/\n+$/, '\n');
-          const after = content.substring(block.end).replace(/^\n+/, '\n');
-          await writeFile(profilePath, before + after);
-          log.success(`Cleaned shell profile: ${profilePath}`);
+      let content = await readFileSafe(profilePath);
+      let cleaned = false;
+      for (const sourced of owned) {
+        const block = content === null ? null : findEnvBlockFor(content, sourced);
+        if (content !== null && block && block.end !== null) {
+          content = content.substring(0, block.start).replace(/\n+$/, '\n') + content.substring(block.end).replace(/^\n+/, '\n');
+          cleaned = true;
         }
+      }
+      if (cleaned && content !== null) {
+        await writeFile(profilePath, content);
+        log.success(`Cleaned shell profile: ${profilePath}`);
       }
     } catch (e) {
       log.warn(`Failed to clean shell profile ${profilePath}: ${(e as Error).message}`);
     }
   }
+  if (plan.envScope) await unregisterEnvScope(plan.envScope);
+  if (plan.shouldRemoveEnvLoader) await removeEnvLoader();
 
   // (f) Remove teamai's docs from the docs directory: the mirror keeps no record, so a
   // doc goes only as a version from the team history; anything else is the member's (#993).
@@ -2636,9 +2665,11 @@ async function removeConfirmed(
   const dispatchLeft = !agentKey || agentKey === 'codex' || plan.includeShared
     ? await stopCodexDispatch(teamConfig, localConfig, plan.includeShared)
     : null;
+  // The workspace instruction excludes a pull wrote (#913), before the records that own them go.
+  const excludesLeft = plan.includeShared ? await withdrawWorkspaceInstructionExcludes(teamConfig, localConfig) : [];
   const { pendingOpencode, hooksLeft, blocksLeft, filesLeft } = await executeRemoval(plan, heldMcp, {
     hooks: dispatchLeft ? [{ what: `the Codex team-hook dispatchers in ${dispatchLeft}`, tool: 'codex' }] : [],
-    files: [...httpSourceLeft, ...plan.keptUnjudged],
+    files: [...httpSourceLeft, ...plan.keptUnjudged, ...excludesLeft],
   });
   const incomplete = pendingOpencode.length > 0 || hooksLeft.length > 0 || blocksLeft.length > 0 || filesLeft.length > 0;
 
@@ -2684,6 +2715,30 @@ async function removeConfirmed(
 }
 
 /**
+ * Take the `claudeMdExcludes` entries each checkout's pull wrote into its
+ * Claude settings for the workspaces above it (#913) back out, leaving the
+ * member's own. The settings files it could not edit, whose records then stay.
+ */
+async function withdrawWorkspaceInstructionExcludes(teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<string[]> {
+  const settings = scopedToolPaths(teamConfig, localConfig).claude?.settings;
+  if (localConfig.scope !== 'project' || !settings) return [];
+  const { syncWorkspaceInstructionExcludes } = await import('./workspace-children.js');
+  const left: string[] = [];
+  for (const { root, claudeMdExcludes } of Object.values((await loadStateForScope(localConfig)).lastPullByWorkspace ?? {})) {
+    if (!root || !claudeMdExcludes?.length) continue;
+    const settingsFile = path.join(root, path.dirname(settings), 'settings.local.json');
+    try {
+      const kept = await syncWorkspaceInstructionExcludes({ projectRoot: root, settingsFile, previous: claudeMdExcludes, withdraw: true });
+      if (kept.length > 0) left.push(settingsFile);
+    } catch (e) {
+      log.warn(`Could not take the workspace instruction excludes out of ${settingsFile}: ${(e as Error).message}`);
+      left.push(settingsFile);
+    }
+  }
+  return left;
+}
+
+/**
  * Stop the project's Codex team hooks that run from the dispatcher in
  * ~/.codex/hooks.json (#915). The file that keeps them running, or null.
  */
@@ -2715,6 +2770,9 @@ async function uninstallHomeOnly(opts: UninstallOptions): Promise<void> {
   console.log('⚠  The following TeamAI home directory will be removed:');
   console.log(`     ${home}/`);
   console.log('');
+  // Read before anything is deleted, as for a user-scope uninstall (#1025).
+  const kept = await keptForProjects();
+  printKeptForProjects(kept);
 
   if (opts.dryRun) {
     log.info('Dry run — no changes made');
@@ -2761,8 +2819,12 @@ async function uninstallHomeOnly(opts: UninstallOptions): Promise<void> {
       process.exitCode = 1;
       return;
     }
-    await remove(home);
-    log.success(`Removed ${home}/`);
+    if (kept.paths.length > 0) {
+      const { forgetUserEnvScope } = await import('./resources/env-loader.js');
+      await forgetUserEnvScope();
+      await removeAllBut(home, kept.paths);
+    } else await remove(home);
+    log.success(kept.paths.length > 0 ? `Removed ${home}/ but ${kept.paths.join(', ')}` : `Removed ${home}/`);
     log.success('teamai uninstalled');
   } catch (e) {
     log.warn(`Failed to remove ${home}: ${(e as Error).message}`);

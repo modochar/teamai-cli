@@ -75,7 +75,15 @@ teamai recall status
 
 One machine overrides this with `recallEnabled` in `~/.teamai/config.yaml`. `TEAMAI_RECALL_DISABLED=1` forces it off. While it is off, pull does not install recall. `teamai recall` still searches.
 
-Turning recall off does not silence the SessionStart hint for recently merged MRs. That hint points to `teamai import --from-mr`, which can capture and publish a learning before the team enables recall. Disable this separate hint with `TEAMAI_MR_HINT_DISABLED=1`.
+Turning recall off does not silence the SessionStart hint for recently merged MRs. That hint points to `teamai import --from-mr`, which can capture and publish a learning before the team enables recall. It has its own switch, so a team can turn it off without touching `contributeHint`:
+
+```yaml
+sharing:
+  mrHint:
+    enabled: false
+```
+
+On one machine, set `mrHintEnabled: false` in `~/.teamai/config.yaml`, or `TEAMAI_MR_HINT_DISABLED=1`.
 
 `language` in `teamai.yaml` is `en` or `zh`. `en` makes the built-in recall rule, the TodoWrite hint, and the merged-MR hint English only. Omit it, or set `zh`, and those texts stay bilingual. The next `teamai pull` rewrites the recall rule.
 
@@ -101,28 +109,35 @@ teamai recall promote <learningId> --dry-run
 
 ## Codebase Knowledge Graph
 
-`teamai import` writes a source repo into the team repo's `teamwiki/`. `teamai recall` searches it too.
+`teamai import` writes a source repo into the team repo's `teamwiki/`. `teamai recall` searches it too. Every source lands in the same place, `<team repo>/teamwiki/evidence/code/<slug>/`; the source directory itself gets no `teamwiki/`.
 
 ```bash
 teamai import --dir /path/to/project
+teamai import --dir /path/to/project --incremental
 teamai import --from-repo https://github.com/org/repo
 teamai import --from-org myorg
 teamai import --from-repo-list repos.yaml
 teamai import --from-mr https://github.com/org/repo/pull/123
+teamai import --from-mr https://github.com/org/repo/pull/123 https://github.com/org/repo/pull/124
 teamai import --from-repo https://github.com/org/repo --incremental
 teamai import --from-repo https://github.com/org/repo --skip-enrich
 ```
 
-After the first import, refresh and check with `teamai codebase`:
+`--from-mr` takes several MR URLs. Each draft is still confirmed on its own (or none with `--all`), the accepted learnings are published once at the end, and each repository's teamwiki is updated once. An MR that fails does not stop the rest; the run ends with a summary and exits non-zero if any failed.
+
+`--incremental` re-extracts only the files changed since the last import; each codebase keeps that baseline in its own `evidence/code/<slug>/`. A remote repo's slug is `<provider>__<owner>__<repo>`, shared by `--from-repo`, `--from-mr` and `teamai ci extract-mr`; `--dir` uses the repo name.
+
+After an import, check and enrich that same `teamwiki/` with `teamai codebase`:
 
 ```bash
-teamai codebase --extract /path/to/repo --project my-service
-teamai codebase --extract /path/to/repo --project my-service --incremental
-teamai codebase --deep-enrich --project my-service --output /path/to/repo
-teamai codebase --lint --output /path/to/repo
+teamai codebase --status
+teamai codebase --deep-enrich --project <slug>
+teamai codebase --lint
 ```
 
-`--output` is the repository root. `--project` becomes `teamwiki/evidence/code/<slug>/`.
+Without a team repo, add `--output <dir>` to both `teamai import` and `teamai codebase`; both then use `<dir>/teamwiki/`.
+
+`teamai codebase --extract` is removed; use `teamai import --dir`.
 
 A recall hit may add `Source freshness:`: `current` matches the last scan, `stale` changed, `missing` is gone, `unknown` could not be checked. `current` does not mean the written knowledge is correct.
 
@@ -144,8 +159,10 @@ Extract knowledge from a merge request. Comment when it opens. After it merges, 
 
 ```bash
 teamai ci extract-mr --url "$MR_URL" --mode comment --individual-comments
-teamai ci extract-mr --url "$MR_URL" --mode write --team-repo ./team-repo --individual-comments
+teamai ci extract-mr --url "$MR_URL" --mode write --team-repo ../team-repo --individual-comments
 ```
+
+Write mode runs in the merged source checkout. Its code knowledge goes through the same path as `teamai import --dir . --incremental`, into `<team-repo>/teamwiki/evidence/code/<provider>__<owner>__<repo>/`, re-extracting only the changed files. Clone the team repo outside the checkout: otherwise its files would be extracted as source, so this step is skipped.
 
 Mark a suggestion to drop it: 👎 on GitHub, ☝️ on TGit. Templates are in [`examples/ci/`](../../examples/ci/README.md).
 

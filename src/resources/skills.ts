@@ -15,13 +15,15 @@ import {
   loadRolesManifest, resolveRoleResourceNamespaces, RolesManifestNotFoundError, type RolesManifest,
 } from '../roles.js';
 import { loadProjectsManifest, resolveProjectResourceNamespaces } from '../projects.js';
+import { deliversEveryNamespace } from '../resource-namespaces.js';
+import { deliveredMembers } from '../workspace-children.js';
 import { assertSafeFallbackNamespaces } from '../manifest-schema.js';
 import { assertWithinRoot, resolveReal } from '../utils/path-safety.js';
 import { openPrDestinations, recordedNamespace } from '../utils/pending-push.js';
 import { splitFrontmatter, stringifyFrontmatter } from '../utils/frontmatter.js';
 import {
   blockingEntries, deliveredSkillFiles, describeKeptDir, describeMembersDirLeft, describeMembersFile, describeMembersLink, describeSkippedLink, isLink, judgeCopy, judgeRemoval, keepsEditedCopy, keepsTrackedCopy,
-  isRecordedFromTeamSkill, isUneditedSkillCopy, membersLinkAt, ownsSkillDir, recordDelivered, recordedUnder, teamaiSkillFiles,
+  isRecordedFromTeamSkill, isTeamSkillAsDelivered, isUneditedSkillCopy, membersLinkAt, ownsSkillDir, recordDelivered, recordedUnder, teamaiSkillFiles,
   type DeliveredHashes, type DeliveryLedger,
 } from './delivered-copies.js';
 
@@ -31,14 +33,27 @@ const SKILL_MD = 'SKILL.md';
 export const CODEX_TOOL = 'codex';
 export const SHARED_AGENT_SKILLS_PATH = '.agents/skills';
 
+/** Why delivery may not write a skill directory: the path itself, or a link on the way to it. */
+export type SkillDirectoryBlock =
+  | { kind: 'outside-base'; target: string; baseDir: string }
+  | { kind: 'members-link'; link: string }
+  | { kind: 'broken-link'; link: string }
+  | { kind: 'link-outside-base'; link: string; resolved: string; baseDir: string }
+  | { kind: 'link-to-other-repository'; link: string; resolved: string };
+
 /**
  * Root links may share skills under the base within one repository (its checkouts share a project
  * identity); a skill's own link remains the member's.
  * Delivery and every team-skill delete apply it, so a root redirected outside the checkout is neither written nor emptied.
+ * Null when `target` may be written; otherwise the reason, naming the path or link that stops it.
  */
-export async function allowsSkillDirectory(baseDir: string, target: string, { keepSkillLink = false } = {}): Promise<boolean> {
+export async function findSkillDirectoryBlock(
+  baseDir: string,
+  target: string,
+  { keepSkillLink = false } = {},
+): Promise<SkillDirectoryBlock | null> {
   const relative = path.relative(baseDir, target);
-  if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return false;
+  if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return { kind: 'outside-base', target, baseDir };
   let walked = baseDir;
   for (const segment of relative.split(path.sep).filter(Boolean)) {
     walked = path.join(walked, segment);
@@ -46,17 +61,45 @@ export async function allowsSkillDirectory(baseDir: string, target: string, { ke
     if (!entry) break;
     if (!entry.isSymbolicLink()) continue;
     // Team-skill ownership checks name and preserve a leaf link without following it.
-    if (walked === target) return keepSkillLink;
+    if (walked === target) return keepSkillLink ? null : { kind: 'members-link', link: walked };
     const resolved = await realpath(walked).catch(() => null);
-    if (!resolved) return false;
+    if (!resolved) return { kind: 'broken-link', link: walked };
     const base = await realpath(baseDir);
     const rel = path.relative(base, resolved);
-    if (rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) return false;
+    if (rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) return { kind: 'link-outside-base', link: walked, resolved, baseDir };
     const [from, to] = await Promise.all([resolveAnchors(base), resolveAnchors(resolved)]);
     // Outside Git (a user-scope home), staying under the base is enough.
-    if (from && from.projectAnchor !== to?.projectAnchor) return false;
+    if (from && from.projectAnchor !== to?.projectAnchor) return { kind: 'link-to-other-repository', link: walked, resolved };
   }
-  return true;
+  return null;
+}
+
+/** Whether delivery may write `target` (`findSkillDirectoryBlock` finds nothing in the way). */
+export async function allowsSkillDirectory(baseDir: string, target: string, options: { keepSkillLink?: boolean } = {}): Promise<boolean> {
+  return await findSkillDirectoryBlock(baseDir, target, options) === null;
+}
+
+/** The warning for a skill delivery skips at `block`. */
+export function describeSkippedSkillDirectory(skillName: string, tool: string, block: SkillDirectoryBlock): string {
+  const why = describeSkillDirectoryBlock(block);
+  const next = block.kind === 'members-link'
+    ? 'Remove the link to let teamai deliver this skill.'
+    : 'Point the skill directory inside the same repository.';
+  return `Skipped ${skillName} (${tool}): ${why}. ${next}`;
+}
+
+function describeSkillDirectoryBlock(block: SkillDirectoryBlock): string {
+  switch (block.kind) {
+    case 'outside-base': return `${block.target} is outside ${block.baseDir}`;
+    case 'members-link': return `${block.link} is your own link`;
+    case 'broken-link': return `${block.link} is a link whose target does not exist`;
+    case 'link-outside-base': return `${block.link} links to ${block.resolved}, outside ${block.baseDir}`;
+    case 'link-to-other-repository': return `${block.link} links to ${block.resolved}, in another repository`;
+    default: {
+      const unhandled: never = block;
+      return unhandled;
+    }
+  }
 }
 
 /** Whether a team-skill delete may reach `skillDir` by the delivery rule; warns and keeps it when not. */
@@ -446,16 +489,36 @@ async function resolveSkillNamespaces(localConfig: LocalConfig): Promise<string[
  * (`resolveSkillNamespaces`, legacy fallbacks included), then those of the
  * active projects, the same union pull delivers from. Without the project
  * half, a project skill was pushable only through legacy mode's first-match
- * scan, which can pick another project's skill of the same name. Null when no
- * role or active project scopes this directory, so every namespace is given.
+ * scan, which can pick another project's skill of the same name. Null only
+ * when pull delivers every namespace here (`deliversEveryNamespace`); a team
+ * with projects and none active gets the role half, as pull delivers it.
  * When the active projects cannot be resolved this is the role half alone,
  * never null: an unscoped scan would match a local skill to any project's
  * skill of its name. Push without `--role` or `--project` stops before that.
  */
 export async function resolvePushSkillNamespaces(localConfig: LocalConfig): Promise<string[] | null> {
+  // A workspace's are those of its own selection and of each child, in that
+  // order (#913), so the first namespace keeps a name as pull's union does.
+  const members = await deliveredMembers(localConfig);
+  if (members) {
+    const namespaces: string[] = [];
+    for (const member of members) {
+      const own = await resolveOwnPushSkillNamespaces(member);
+      if (own === null) return null;
+      namespaces.push(...own);
+    }
+    return [...new Set(namespaces)];
+  }
+  return resolveOwnPushSkillNamespaces(localConfig);
+}
+
+async function resolveOwnPushSkillNamespaces(localConfig: LocalConfig): Promise<string[] | null> {
   const roleNamespaces = await resolveSkillNamespaces(localConfig);
   const activeProjects = localConfig.projects ?? [];
-  if (activeProjects.length === 0) return roleNamespaces.length > 0 ? roleNamespaces : null;
+  if (activeProjects.length === 0) {
+    if (roleNamespaces.length === 0 && await deliversEveryNamespace(localConfig)) return null;
+    return roleNamespaces;
+  }
   const manifest = await loadProjectsManifest(localConfig.repo.localPath);
   if (!manifest) return roleNamespaces;
   let projectNamespaces: string[];
@@ -478,12 +541,20 @@ export async function resolvePushSkillNamespaces(localConfig: LocalConfig): Prom
 export async function recordedOrigin<TCopy extends { dir: string }>(
   copies: readonly TCopy[], record: { delivered: DeliveredHashes; dest: string; repoPath: string },
 ): Promise<TCopy | undefined> {
+  const matched = await recordedOrigins(copies, record);
+  return matched.length === 1 ? matched[0] : undefined;
+}
+
+/** Each of `copies` whose history holds the SKILL.md version pull recorded at `dest`. */
+async function recordedOrigins<TCopy extends { dir: string }>(
+  copies: readonly TCopy[], record: { delivered: DeliveredHashes; dest: string; repoPath: string },
+): Promise<TCopy[]> {
   const matched: TCopy[] = [];
   for (const copy of copies) {
     const teamDir = path.relative(record.repoPath, copy.dir).split(path.sep).join('/');
     if (await isRecordedFromTeamSkill(record.delivered, record.dest, record.repoPath, teamDir)) matched.push(copy);
   }
-  return matched.length === 1 ? matched[0] : undefined;
+  return matched;
 }
 
 /** Build a skill push item with the origin fields shared by every push path. */
@@ -535,6 +606,19 @@ function warnUnprovenOrigin(
     `[skills] Skipped ${name}${sourcePath ? ` at ${sourcePath}` : ''}: teamai delivered this copy, but its record matches `
     + `${copies.length === 0 ? 'no current team skill' : copies.length === 1 ? `no version of ${holders}` : `no single one of ${holders}`}, `
     + 'so push cannot prove where it came from. To send the edit as a new skill, copy it under a new name and push that.',
+  );
+}
+
+/**
+ * Say why push leaves out a local skill no record ties to the team: the team
+ * keeps a skill of its name only in `copies`, namespaces this scope does not
+ * select, so pushing it would replace a skill pull never delivered here.
+ */
+function warnOutOfScope(name: string, copies: readonly { dir: string }[], repoPath: string): void {
+  const holders = copies.map((copy) => path.relative(repoPath, copy.dir).split(path.sep).join('/')).join(', ');
+  warnOnce(
+    `[skills] Skipped ${name}: the team keeps a skill of this name only outside your active namespaces (${holders}). `
+    + 'Rename yours to share it, or run `teamai projects set <id>` or `teamai roles set <role>` if it is that skill.',
   );
 }
 
@@ -626,23 +710,24 @@ async function otherVersionFiles(repoPath: string, item: ResourceItem): Promise<
  * count such an extra as a change, so it may never have been pushed. One at a
  * path another version has is named, since it may be an edited leftover.
  * `delivered` tells them apart (#822): a file still as teamai recorded writing
- * it is a leftover, and one it has no record of is the member's own.
+ * it is a leftover, and one it has no record of is the member's own. So a file
+ * the team deleted from this skill goes too, or the next push would add it back.
  */
 async function removeLeftoverVersionFiles(
   source: string, dest: string, otherVersions: Map<string, string[]>, delivered: DeliveredHashes | undefined,
 ): Promise<void> {
-  if (otherVersions.size === 0) return;
+  if (otherVersions.size === 0 && delivered === undefined) return;
   const sourceFiles = new Set(await listFilesRecursive(source));
   let removed = false;
   for (const file of await listFilesRecursive(dest)) {
-    const versions = otherVersions.get(file);
-    if (sourceFiles.has(file) || !versions) continue;
+    if (sourceFiles.has(file)) continue;
+    const versions = otherVersions.get(file) ?? [];
     const installed = path.join(dest, file);
     const recorded = delivered?.[installed];
     const leftover = (recorded !== undefined && await fileHash(installed) === recorded)
       || (await Promise.all(versions.map((version) => fileContentEqual(installed, version)))).some(Boolean);
     if (!leftover) {
-      if (delivered !== undefined && recorded === undefined) continue;
+      if (versions.length === 0 || (delivered !== undefined && recorded === undefined)) continue;
       log.warn(
         `Kept ${installed}: another team version of this skill has a file at that path with different content, `
         + 'so it may be yours or an edited copy. Delete it if you do not need it.',
@@ -693,6 +778,12 @@ export type CopyDestination =
   | { kind: 'new' }
   /** Delivered, but its record ties it to none, or several, of `candidates`. */
   | { kind: 'unproven'; candidates: readonly { dir: string }[] }
+  /**
+   * Delivered once by a workspace for same-named team skills of equal content
+   * (#913): the edit goes to each of `teamSkills`, which still hold what was
+   * delivered, and not to `diverged`, which the team changed since.
+   */
+  | { kind: 'shared'; teamSkills: readonly { dir: string; namespace?: string }[]; diverged: readonly { dir: string }[] }
   /** Never delivered, and the legacy layout holds the name in several places. */
   | { kind: 'ambiguous'; candidates: readonly { dir: string }[] }
   /** Never delivered, and only namespaces this scope doesn't select hold the name. */
@@ -831,12 +922,31 @@ export async function resolveDestination(input: {
   pending: readonly PendingPush[];
   repoPath: string;
   role?: string;
+  /**
+   * In a workspace with children, the team skill directories its members
+   * deliver from (`deliveredSkillSources`, #913): one copy can stand for
+   * several same-named skills of equal content.
+   */
+  deliveredSources?: ReadonlySet<string>;
 }): Promise<CopyDestination> {
   const { name, dest, team, delivered, repoPath } = input;
   if (recordedUnder(delivered, dest).length > 0) {
     const copies = team.allTeamSkills.get(name) ?? [];
-    const origin = await recordedOrigin(copies, { delivered, dest, repoPath });
-    return origin ? { kind: 'team', teamSkill: origin, proven: true } : { kind: 'unproven', candidates: copies };
+    const origins = await recordedOrigins(copies, { delivered, dest, repoPath });
+    if (origins.length === 1) return { kind: 'team', teamSkill: origins[0]!, proven: true };
+    // Several a workspace's members deliver: each one that still holds what it
+    // delivered. A matching history alone does not make a copy one of them.
+    const delivering = origins.filter((copy) => input.deliveredSources?.has(path.resolve(copy.dir)));
+    if (delivering.length === 1) return { kind: 'team', teamSkill: delivering[0]!, proven: true };
+    if (delivering.length > 1) {
+      const teamSkills: Array<{ dir: string; namespace?: string }> = [];
+      const diverged: Array<{ dir: string }> = [];
+      for (const copy of delivering) {
+        (await isTeamSkillAsDelivered(delivered, dest, copy.dir) ? teamSkills : diverged).push(copy);
+      }
+      if (teamSkills.length > 0) return { kind: 'shared', teamSkills, diverged };
+    }
+    return { kind: 'unproven', candidates: copies };
   }
   const open = await openPrDestinations({ pending: input.pending, name, repoPath });
   const awaiting = open.length > 1
@@ -873,6 +983,8 @@ export class SkillsHandler extends ResourceHandler {
     teamConfig: TeamaiConfig, localConfig: LocalConfig, options?: ScanForPushOptions,
   ): Promise<ResourceItem[]> {
     const team = await readTeamSkillIndex(localConfig.repo.localPath, await resolvePushSkillNamespaces(localConfig));
+    // Loaded here: desired.js reaches this module through the handlers it imports.
+    const deliveredSources = await (await import('./desired.js')).deliveredSkillSources(teamConfig, localConfig);
 
     // Read tombstones to skip previously deleted resources
     const tombstones = await this.readTombstones(localConfig);
@@ -932,7 +1044,7 @@ export class SkillsHandler extends ResourceHandler {
         if (await isUneditedSkillCopy(delivered, localDirPath)) continue;
         const destination = await resolveDestination({
           name: dir, dest: localDirPath, team, delivered, pending: options?.pending ?? [], repoPath: localConfig.repo.localPath,
-          role: options?.namespace,
+          role: options?.namespace, ...deliveredSources ? { deliveredSources } : {},
         });
         if (destination.kind === 'unproven') {
           warnUnprovenOrigin(dir, destination.candidates, localConfig.repo.localPath);
@@ -948,7 +1060,10 @@ export class SkillsHandler extends ResourceHandler {
           );
           continue;
         }
-        if (destination.kind === 'outOfScope') continue;
+        if (destination.kind === 'outOfScope') {
+          if (physicalPath !== options?.requestedSkillPath) warnOutOfScope(dir, destination.candidates, localConfig.repo.localPath);
+          continue;
+        }
         if (destination.kind === 'ambiguousOpenPr') {
           // Returned with the reason it is skipped, so its open PRs' records survive the prune.
           const awaitingAt = destination.records.map((r) => `${r.relativePath} (branch ${r.branch})`).join(', ');
@@ -977,64 +1092,77 @@ export class SkillsHandler extends ResourceHandler {
           continue;
         }
 
-        // A copy awaiting review is new at the destination its open PR holds,
-        // which is not on the team repo, so there is nothing to compare it with.
-        let target: { dir: string; namespace?: string };
-        let status: ResourceItemStatus = 'new';
-        let fromInactiveNamespace = false;
-        if (destination.kind === 'openPr') {
-          target = destination;
-        } else {
-          // Skill exists in team repo — check if content differs
-          const { teamSkill } = destination;
-          const teamDirPath = teamSkill.dir;
-          const equal = await dirTeamSubsetEqual(localDirPath, teamDirPath, [CONTRIBUTORS_FILE]);
-          if (equal) continue; // This tool dir's copy is identical, skip
-          // Single-repo mode: like `.teamai/rules` (see the rules scan), the
-          // active tree's `.teamai/skills` is never refreshed, and a branch
-          // behind the default branch holds older copies nobody edited (#823).
-          const teamRelDir = path.relative(localConfig.repo.localPath, teamDirPath).split(path.sep).join('/');
-          if (tool === SELF_KNOWLEDGE_SCAN_KEY && localConfig.projectRoot
-            && await isPastSkillVersion(localConfig.repo.localPath, localConfig.projectRoot, localDirPath, teamDirPath, teamRelDir)) {
-            log.warn(
-              `[skills] Skipped ${dir}: ${path.relative(resolveToolBaseDir(tool, localConfig), localDirPath)} is an older `
-              + `version of ${teamRelDir}, which has changed on the team since. `
-              + 'Copy the current files over it (or delete it) before editing.',
-            );
-            continue;
-          }
-          // Content differs — candidate for "modified"
-          target = teamSkill;
-          status = 'modified';
-          fromInactiveNamespace = destination.proven;
+        // A copy a workspace delivered for several team skills goes back to
+        // each that still holds what it delivered (#913).
+        if (destination.kind === 'shared' && destination.diverged.length > 0) {
+          const relative = (copies: readonly { dir: string }[]): string => copies
+            .map((copy) => path.relative(localConfig.repo.localPath, copy.dir).split(path.sep).join('/')).join(', ');
+          warnOnce(`[skills] ${dir}: ${relative(destination.diverged)} changed on the team since this copy was delivered, `
+            + `so the edit goes to ${relative(destination.teamSkills)} only. Bring it over by hand if it applies there too.`);
         }
+        const destinations = destination.kind === 'shared'
+          ? destination.teamSkills.map((teamSkill) => ({ kind: 'team' as const, teamSkill, proven: true }))
+          : [destination];
+        for (const copyDestination of destinations) {
+          // A copy awaiting review is new at the destination its open PR holds,
+          // which is not on the team repo, so there is nothing to compare it with.
+          let target: { dir: string; namespace?: string };
+          let status: ResourceItemStatus = 'new';
+          let fromInactiveNamespace = false;
+          if (copyDestination.kind === 'openPr') {
+            target = copyDestination;
+          } else {
+            // Skill exists in team repo — check if content differs
+            const { teamSkill } = copyDestination;
+            const teamDirPath = teamSkill.dir;
+            const equal = await dirTeamSubsetEqual(localDirPath, teamDirPath, [CONTRIBUTORS_FILE]);
+            if (equal) continue; // This tool dir's copy is identical, skip
+            // Single-repo mode: like `.teamai/rules` (see the rules scan), the
+            // active tree's `.teamai/skills` is never refreshed, and a branch
+            // behind the default branch holds older copies nobody edited (#823).
+            const teamRelDir = path.relative(localConfig.repo.localPath, teamDirPath).split(path.sep).join('/');
+            if (tool === SELF_KNOWLEDGE_SCAN_KEY && localConfig.projectRoot
+              && await isPastSkillVersion(localConfig.repo.localPath, localConfig.projectRoot, localDirPath, teamDirPath, teamRelDir)) {
+              log.warn(
+                `[skills] Skipped ${dir}: ${path.relative(resolveToolBaseDir(tool, localConfig), localDirPath)} is an older `
+                + `version of ${teamRelDir}, which has changed on the team since. `
+                + 'Copy the current files over it (or delete it) before editing.',
+              );
+              continue;
+            }
+            // Content differs — candidate for "modified"
+            target = teamSkill;
+            status = 'modified';
+            fromInactiveNamespace = copyDestination.proven;
+          }
 
-        const mtime = await getDirLatestMtime(localDirPath);
-        const candidateKey = `destination:${target.dir}`;
-        const existing = candidates.get(candidateKey);
-        if (!existing || mtime > existing.mtime) {
-          if (existing && !await dirContentEqual(existing.sourcePath, localDirPath, [CONTRIBUTORS_FILE])) {
-            warnOnce(`[skills] Skipped ${dir} at ${existing.sourcePath}: another edited copy for `
-              + `${path.relative(localConfig.repo.localPath, target.dir).split(path.sep).join('/')} has newer content.`);
-          }
-          // A destination one copy proves stays proven whichever copy is
-          // newer, so a flag cannot move it.
-          const proven = fromInactiveNamespace || existing?.originProven === true;
-          candidates.set(candidateKey, {
-            name: dir, sourcePath: localDirPath, mtime, status, namespace: target.namespace,
-            ...proven ? { fromInactiveNamespace: true } : {},
-            ...fromInactiveNamespace ? { deliveryRecorded: true } : {},
-            ...proven ? { originProven: true, originCandidates: [target] } : {},
-          });
-        } else {
-          if (fromInactiveNamespace && !existing.originProven) {
+          const mtime = await getDirLatestMtime(localDirPath);
+          const candidateKey = `destination:${target.dir}`;
+          const existing = candidates.get(candidateKey);
+          if (!existing || mtime > existing.mtime) {
+            if (existing && !await dirContentEqual(existing.sourcePath, localDirPath, [CONTRIBUTORS_FILE])) {
+              warnOnce(`[skills] Skipped ${dir} at ${existing.sourcePath}: another edited copy for `
+                + `${path.relative(localConfig.repo.localPath, target.dir).split(path.sep).join('/')} has newer content.`);
+            }
+            // A destination one copy proves stays proven whichever copy is
+            // newer, so a flag cannot move it.
+            const proven = fromInactiveNamespace || existing?.originProven === true;
             candidates.set(candidateKey, {
-              ...existing, fromInactiveNamespace: true, originProven: true, originCandidates: [target],
+              name: dir, sourcePath: localDirPath, mtime, status, namespace: target.namespace,
+              ...proven ? { fromInactiveNamespace: true } : {},
+              ...fromInactiveNamespace ? { deliveryRecorded: true } : {},
+              ...proven ? { originProven: true, originCandidates: [target] } : {},
             });
-          }
-          if (!await dirContentEqual(existing.sourcePath, localDirPath, [CONTRIBUTORS_FILE])) {
-            warnOnce(`[skills] Skipped ${dir} at ${localDirPath}: another edited copy for `
-              + `${path.relative(localConfig.repo.localPath, target.dir).split(path.sep).join('/')} has newer content.`);
+          } else {
+            if (fromInactiveNamespace && !existing.originProven) {
+              candidates.set(candidateKey, {
+                ...existing, fromInactiveNamespace: true, originProven: true, originCandidates: [target],
+              });
+            }
+            if (!await dirContentEqual(existing.sourcePath, localDirPath, [CONTRIBUTORS_FILE])) {
+              warnOnce(`[skills] Skipped ${dir} at ${localDirPath}: another edited copy for `
+                + `${path.relative(localConfig.repo.localPath, target.dir).split(path.sep).join('/')} has newer content.`);
+            }
           }
         }
       }
@@ -1166,8 +1294,9 @@ export class SkillsHandler extends ResourceHandler {
       const skillsDir = await skillsDirForTool(tool, toolPaths[tool].skills, localConfig);
       if (!skillsDir) continue;
       const guard = await skillsGuardBase(resolveBaseDir(localConfig), skillsDir);
-      if (!await allowsSkillDirectory(guard, path.join(skillsDir, item.name), { keepSkillLink: true })) {
-        log.warn(`Skipped ${item.name} (${tool}): the skill path leaves this checkout or is a member-owned link. Point the skill directory inside the same repository.`);
+      const block = await findSkillDirectoryBlock(guard, path.join(skillsDir, item.name), { keepSkillLink: true });
+      if (block) {
+        warnOnce(describeSkippedSkillDirectory(item.name, tool, block));
         continue;
       }
       const ownsShared = async (dest: string): Promise<boolean> =>

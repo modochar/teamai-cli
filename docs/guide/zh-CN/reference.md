@@ -66,8 +66,8 @@ repo:
   remote: https://github.com/your-org/your-repo.git
 username: your-name
 updatePolicy: auto             # auto / prompt / skip
-scope: project                 # project（init 默认）或 user
-projectRoot: /path/to/project
+scope: workspace               # workspace（init 默认）或 user；project 按 workspace 读取
+projectRoot: /path/to/my-workspace
 inheritUserScope: true
 coAuthorEnabled: true
 gitExcludeEnabled: true
@@ -78,6 +78,8 @@ toolRoots:
   claude: ~/.claude-work
   codex: ~/.codex-alt
 ```
+
+角色、项目和 tag 字段保存的是这个目录自己的选择。workspace 还会交付其中已初始化仓库的选择，这些选择在每次 pull 时读取，不会写入这里。参见[包含仓库的 workspace](./distribution.md#包含仓库的-workspace)。
 
 #### 迁移后的工具根目录（`toolRoots`）
 

@@ -41,7 +41,7 @@ In the **CLI clone** (not as `teamai init .`):
 
 ```bash
 npm run build && npm link
-teamai init https://github.com/teamai-hub/teamai-cli-dev --scope project --role dev
+teamai init https://github.com/teamai-hub/teamai-cli-dev --scope workspace --role dev
 teamai pull
 git status   # nothing under .teamai/ or tool dirs should be staged for this repo
 ```
@@ -80,6 +80,10 @@ src/
 ```
 
 See [docs/dev/adding-a-provider.md](../docs/dev/adding-a-provider.md) for how to add a new git provider.
+
+Before you change `src/session-flow/`, read [docs/dev/agent-sessions.md](../docs/dev/agent-sessions.md). It lists the rules that span more than one file.
+
+Before you change `src/workflow/`, read [docs/dev/workflow-engine.md](../docs/dev/workflow-engine.md). It lists the rules that span more than one file.
 
 ## Making a Change
 

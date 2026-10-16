@@ -1,10 +1,11 @@
 import YAML from 'yaml';
 import fs from 'node:fs';
 import path from 'node:path';
+import { readWorkspaceChildren } from './workspace-children.js';
 import { saveLocalConfig, loadTeamConfig, saveLocalConfigForScope, loadLocalConfigForScope, loadStateForScope, saveStateForScope, resolveProjectDataHome } from './config.js';
 import { deliveredHookFiles, describeUnappliedTeamHooks, hasTeamaiHooks, reconcileHooks, reconcileTeamHooksForConfig, reportCodexTrust, trustCodexForScope } from './hooks.js';
-import { configureGitUser, initRepo, isGitRepo, getRemoteUrl, remotesMatch, redactGitCredentials, pullRepoFastForward } from './utils/git.js';
-import { pushRepoDirectly } from './utils/git.js';
+import { configureGitUser, initRepo, isGitRepo, getRemoteUrl, remotesMatch, redactGitCredentials, pullRepoFastForward, pushRepoDirectly, autoPushViaMR, initPushBlockTimeoutMs } from './utils/git.js';
+import { withTimeout } from './utils/async.js';
 import { getProvider, detectProvider, detectProviderForInit, RepoNotFoundError, OrganizationNotFoundError, RepoCreatePermissionError } from './providers/index.js';
 import { parseGenericGitExistingRemote } from './providers/git/repo-url.js';
 import { probeSelfHostedGitLab } from './providers/gitlab/probe.js';
@@ -88,9 +89,11 @@ import {
   ProviderNameSchema,
   type ProviderName,
   type Scope,
+  parseInstallScope,
   getTeamaiHome,
   getConfigPath,
   getDataHome,
+  installScopeName,
 } from './types.js';
 import { getUserHome } from './utils/home.js';
 import { describeRoles, listRoleIds, loadRolesManifest, RolesManifestNotFoundError } from './roles.js';
@@ -425,9 +428,9 @@ async function resolveProjectsForInit(
 /**
  * Resolve init install scope from `--scope` / default.
  *
- * - Explicit `user` / `project` → use as-is (`explicit: true`)
+ * - Explicit `user` / `workspace` (or its older name `project`) → use as-is (`explicit: true`)
  * - Invalid value → throw
- * - Omitted → **project** (cwd), unless cwd === home (E1: fall back to user)
+ * - Omitted → **workspace** (cwd), unless cwd === home (E1: fall back to user)
  *
  * Local install location is decided only by the CLI; remote `teamai.yaml.scope`
  * is ignored (see issue #250).
@@ -442,18 +445,16 @@ export function resolveInitScope(
   const atHome = cwdResolved === homeResolved;
 
   if (rawScope !== undefined && rawScope !== '') {
-    if (rawScope !== 'user' && rawScope !== 'project') {
-      throw new Error(`Invalid scope "${rawScope}". Use "project" (default) or "user".`);
-    }
-    if (rawScope === 'project' && atHome) {
+    const scope = parseInstallScope(rawScope);
+    if (scope === 'project' && atHome) {
       throw new Error(
-        'Cannot use --scope project in your home directory (paths would collide with user scope). ' +
-        'cd to a project directory first, or omit --scope / use --scope user.',
+        'Cannot use the workspace scope in your home directory (paths would collide with user scope). ' +
+        'cd to a workspace directory first, or omit --scope / use --scope user.',
       );
     }
     return {
-      scope: rawScope,
-      projectRoot: rawScope === 'project' ? cwdResolved : undefined,
+      scope,
+      projectRoot: scope === 'project' ? cwdResolved : undefined,
       explicit: true,
     };
   }
@@ -488,7 +489,7 @@ export function resolveInheritUserScope(
   existing: boolean | undefined,
 ): boolean | undefined {
   if (requested === true && scope !== 'project') {
-    throw new Error('--inherit-user-scope can only be used with project scope.');
+    throw new Error('--inherit-user-scope can only be used with workspace scope.');
   }
   if (scope !== 'project') return undefined;
   return requested ?? existing;
@@ -574,7 +575,7 @@ function printScopeSummary(
 ): void {
   const configPath = getConfigPath(scope, projectRoot);
   const baseDir = scope === 'project' ? (projectRoot ?? process.cwd()) : getUserHome();
-  log.info(`Scope: ${scope}${scope === 'project' ? ` (${projectRoot})` : ''}`);
+  log.info(`Scope: ${installScopeName(scope)}${scope === 'project' ? ` (${projectRoot})` : ''}`);
   log.info(`  config    → ${configPath}`);
   log.info(`  resources → ${baseDir}/.claude/skills, ...`);
   if (!explicit && scope === 'project') {
@@ -795,7 +796,8 @@ async function reconcileHooksForInit(
 ): Promise<void> {
   let reconciled: Awaited<ReturnType<typeof reconcileTeamHooksForConfig>>;
   try {
-    reconciled = await reconcileTeamHooksForConfig(teamConfig, localConfig, { filterAgents });
+    // A workspace's hooks include its children's, as pull delivers them (#913).
+    reconciled = await reconcileTeamHooksForConfig(teamConfig, await readWorkspaceChildren(localConfig), { filterAgents });
   } catch (e) {
     // The agent hooks are in place; the rest of init still runs.
     log.error((e as Error).message);
@@ -879,7 +881,7 @@ export function buildSelfModeGitignore(): string {
     'env.sh',
     // What env.sh has exported, as hashes (#879 Conflict 10).
     'env.sh.exports.json',
-    // env.local is the machine-local KEY=value backup pull writes for ${VAR}
+    // env.local is the machine-local env backup pull writes for ${VAR}
     // resolution (self mode uses this name to avoid colliding with the env/ dir).
     'env.local',
     'usage.jsonl',
@@ -1178,7 +1180,7 @@ export async function initSelfRepo(options: GlobalOptions & {
     return;
   }
 
-  log.info(`Scope: project (${businessRepoRoot})`);
+  log.info(`Scope: workspace (${businessRepoRoot})`);
   log.info(`  knowledge → ${localPath}/{skills,rules,docs,learnings} (committed to main)`);
   log.info(`  reports   → ${REPORTS_BRANCH} orphan branch (members/sessions/votes/stats)`);
 
@@ -1188,7 +1190,7 @@ export async function initSelfRepo(options: GlobalOptions & {
   const existingConfigPath = path.join(partitionHome, 'config.yaml');
   const legacyConfigPath = getConfigPath('project', businessRepoRoot);
   if ((await pathExists(existingConfigPath)) || (await pathExists(legacyConfigPath))) {
-    log.warn(`teamai is already initialized (project scope) at ${existingConfigPath}`);
+    log.warn(`teamai is already initialized (workspace scope) at ${existingConfigPath}`);
     if (options.force) {
       log.info('Overwriting existing config (--force)');
     } else {
@@ -1437,26 +1439,30 @@ export async function initSelfRepo(options: GlobalOptions & {
       const { isPublished } = await import('./utils/branch-worktree.js');
       let isNewSelfMember = false;
       let selfMemberChanged = false;
-      const pushed = isPublished(await updateReports(localConfig, async (wt) => {
-        const memberDir = path.join(wt, 'members');
-        await ensureDir(memberDir);
-        const memberPath = path.join(memberDir, `${username}.yaml`);
-        isNewSelfMember = !await pathExists(memberPath);
-        const existingSelfMember = await readMemberConfig(memberReadRoots(wt, localConfig), username);
-        const merged = mergeMemberConfig(existingSelfMember, {
-          username,
-          projects: localConfig.projects,
-        });
-        selfMemberChanged = merged.changed;
-        if (!merged.changed) return null;
-        await writeFile(memberPath, YAML.stringify(merged.config));
-        return {
-          files: ['members/'],
-          message: isNewSelfMember
-            ? `[teamai] Register member: ${username}`
-            : `[teamai] Update member roster: ${username}`,
-        };
-      }));
+      const pushed = isPublished(await withTimeout(
+        updateReports(localConfig, async (wt) => {
+          const memberDir = path.join(wt, 'members');
+          await ensureDir(memberDir);
+          const memberPath = path.join(memberDir, `${username}.yaml`);
+          isNewSelfMember = !await pathExists(memberPath);
+          const existingSelfMember = await readMemberConfig(memberReadRoots(wt, localConfig), username);
+          const merged = mergeMemberConfig(existingSelfMember, {
+            username,
+            projects: localConfig.projects,
+          });
+          selfMemberChanged = merged.changed;
+          if (!merged.changed) return null;
+          await writeFile(memberPath, YAML.stringify(merged.config));
+          return {
+            files: ['members/'],
+            message: isNewSelfMember
+              ? `[teamai] Register member: ${username}`
+              : `[teamai] Update member roster: ${username}`,
+          };
+        }, { initPush: true }),
+        initPushBlockTimeoutMs(),
+        'Member registration push',
+      ));
       if (selfMemberChanged) {
         if (pushed) {
           log.success(isNewSelfMember
@@ -1607,7 +1613,7 @@ export async function init(options: GlobalOptions & {
 
   // Step 0.5: Re-init guard — warn if config already exists
   if (await pathExists(existingConfigPath)) {
-    log.warn(`teamai is already initialized for ${scope} scope at ${existingConfigPath}`);
+    log.warn(`teamai is already initialized for ${installScopeName(scope)} scope at ${existingConfigPath}`);
     if (options.force) {
       log.info('Overwriting existing config (--force)');
     } else {
@@ -1963,14 +1969,18 @@ export async function init(options: GlobalOptions & {
   // after that go to teamai-reports.
   if (createdSkeleton && !options.dryRun) {
     try {
-      await pushRepoDirectly(localPath, '[teamai] Initialize team repo skeleton', [
-        'teamai.yaml',
-        'skills/.gitkeep',
-        'rules/.gitkeep',
-        'docs/.gitkeep',
-        'env/.gitkeep',
-        'members/.gitkeep',
-      ]);
+      await withTimeout(
+        pushRepoDirectly(localPath, '[teamai] Initialize team repo skeleton', [
+          'teamai.yaml',
+          'skills/.gitkeep',
+          'rules/.gitkeep',
+          'docs/.gitkeep',
+          'env/.gitkeep',
+          'members/.gitkeep',
+        ], { initPush: true }),
+        initPushBlockTimeoutMs(),
+        'Skeleton push',
+      );
     } catch (e) {
       log.warn(`Push failed (you can push manually later): ${(e as Error).message}`);
     }
@@ -1986,27 +1996,31 @@ export async function init(options: GlobalOptions & {
       const { isPublished } = await import('./utils/branch-worktree.js');
       let memberChanged = false;
       let memberProjects: string[] | undefined;
-      const pushed = isPublished(await updateReports(reportsConfig, async (wt) => {
-        const memberDir = path.join(wt, 'members');
-        await ensureDir(memberDir);
-        const memberPath = path.join(memberDir, `${username}.yaml`);
-        isNewMember = !await pathExists(memberPath);
-        const existingMember = await readMemberConfig(memberReadRoots(wt, reportsConfig), username);
-        const merged = mergeMemberConfig(existingMember, {
-          username,
-          projects: resolvedProjects,
-        });
-        memberChanged = merged.changed;
-        memberProjects = merged.config.projects;
-        if (!merged.changed) return null;
-        await writeFile(memberPath, YAML.stringify(merged.config));
-        return {
-          files: ['members/'],
-          message: isNewMember
-            ? `[teamai] Register member: ${username}`
-            : `[teamai] Update member roster: ${username}`,
-        };
-      }));
+      const pushed = isPublished(await withTimeout(
+        updateReports(reportsConfig, async (wt) => {
+          const memberDir = path.join(wt, 'members');
+          await ensureDir(memberDir);
+          const memberPath = path.join(memberDir, `${username}.yaml`);
+          isNewMember = !await pathExists(memberPath);
+          const existingMember = await readMemberConfig(memberReadRoots(wt, reportsConfig), username);
+          const merged = mergeMemberConfig(existingMember, {
+            username,
+            projects: resolvedProjects,
+          });
+          memberChanged = merged.changed;
+          memberProjects = merged.config.projects;
+          if (!merged.changed) return null;
+          await writeFile(memberPath, YAML.stringify(merged.config));
+          return {
+            files: ['members/'],
+            message: isNewMember
+              ? `[teamai] Register member: ${username}`
+              : `[teamai] Update member roster: ${username}`,
+          };
+        }, { initPush: true }),
+        initPushBlockTimeoutMs(),
+        'Member registration push',
+      ));
       if (memberChanged) {
         log.success(isNewMember
           ? `Registered as team member: ${username}`
@@ -2054,10 +2068,37 @@ export async function init(options: GlobalOptions & {
 
           if (!options.dryRun) {
             try {
-              await pushRepoDirectly(localPath, `[teamai] Configure reviewers: ${reviewers.join(', ')}`, [
-                'teamai.yaml',
-              ]);
-              log.success('Reviewer config pushed to team repo');
+              // Reviewer config goes via MR: a protected default branch rejects
+              // a direct push (the original bug), and an MR lands it on a
+              // feature branch for a maintainer to merge. The push itself uses
+              // createGitForInitPush (spawn-level timeout); the provider's
+              // pr-create spawnSync also carries the init-push timeout so a
+              // stalled gh/gf process cannot block the event loop past it.
+              const mrTeamConfig = await loadTeamConfig(localPath);
+              const mrLocalConfig = {
+                repo: { remote: repoInfo.httpsUrl, localPath },
+                username,
+                ...(forcedProvider ? { provider: forcedProvider } : {}),
+              };
+              if (mrTeamConfig) {
+                const prUrl = await withTimeout(
+                  autoPushViaMR(
+                    localPath,
+                    `[teamai] Configure reviewers: ${reviewers.join(', ')}`,
+                    ['teamai.yaml'],
+                    mrTeamConfig,
+                    mrLocalConfig,
+                    { initPush: true },
+                  ),
+                  initPushBlockTimeoutMs(),
+                  'Reviewer config push',
+                );
+                if (prUrl) {
+                  log.success(`Reviewer config pushed via MR: ${prUrl}`);
+                } else {
+                  log.warn('Reviewer config MR could not be created (you can push manually later)');
+                }
+              }
             } catch (e) {
               log.warn(`Push failed (you can push manually later): ${(e as Error).message}`);
             }
@@ -2142,7 +2183,7 @@ export async function init(options: GlobalOptions & {
     const gitignorePath = path.join(teamaiHome, '.gitignore');
     if (!await pathExists(gitignorePath)) {
       await writeFile(gitignorePath, buildProjectScopeGitignore());
-      log.debug('Generated .teamai/.gitignore for project scope');
+      log.debug('Generated .teamai/.gitignore for workspace scope');
     }
   } else {
     log.success(`Local config saved to ${getTeamaiHomeDir()}/config.yaml`);

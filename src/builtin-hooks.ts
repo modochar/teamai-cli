@@ -205,22 +205,34 @@ function getHookShellCommand(): string {
   return _winBashLauncherCache;
 }
 
-/** Generate the hook-dispatch command for a given event, tool, and optional matcher. */
+/**
+ * Generate the hook-dispatch command for a given event, tool, and optional matcher.
+ * A Codex tool keeps bare `bash` on Windows too: Codex runs its Windows form from
+ * the entry's `commandWindows` (toCodexEntry in hooks.ts), and a machine-specific
+ * Git Bash path here would change the project `hooks.json` a repository commits on
+ * every Windows pull.
+ */
 export function getDispatchCommand(event: string, tool: string, matcher?: string, binPath?: string): string {
   const bin = binPath ?? 'teamai';
   const matcherArg = matcher && matcher !== '*' ? ` --matcher ${matcher}` : '';
-  return `${getHookShellCommand()} -lc "${bin} hook-dispatch ${event} --tool ${tool}${matcherArg} 2>/dev/null" || true`;
+  const shell = isCodexTool(tool) ? 'bash' : getHookShellCommand();
+  return `${shell} -lc "${bin} hook-dispatch ${event} --tool ${tool}${matcherArg} 2>/dev/null" || true`;
 }
 
 /**
  * Tools whose hook runner on Windows is PowerShell itself, so the rendered
  * command must be PowerShell syntax there rather than the POSIX `bash -lc "…"`
- * form. DSH is the one such host: its Claude-compatible bridge hands each
- * command to its own shell, which on Windows is `@deepseek-ai/dsh-pwsh-local` —
- * a PowerShell runner that prepends an encoding preamble to the command and
- * parses the result. `"<git-bash>" -lc "…"` is a ParserError under it, so every
- * dsh hook failed with `exitCode: 1` and, because the wrapper ends in
- * `2>/dev/null || true`, failed silently (issue #1005).
+ * form. Two such hosts so far:
+ *
+ * - DSH: its Claude-compatible bridge hands each command to its own shell,
+ *   which on Windows is `@deepseek-ai/dsh-pwsh-local` — a PowerShell runner
+ *   that prepends an encoding preamble to the command and parses the result
+ *   (issue #1005).
+ * Codex also runs command hooks with PowerShell on Windows (issue #1074), but
+ * its entries have a Windows-only `commandWindows`, which toCodexEntry in
+ * hooks.ts fills with the PowerShell form; its `command` stays the POSIX form
+ * on every platform, so a project `.codex/hooks.json` a repository commits does
+ * not change with the platform of the member who pulled last.
  */
 const WINDOWS_PWSH_TOOLS = new Set(['dsh']);
 
@@ -374,8 +386,8 @@ const SUBAGENT_STOP_TOOLS = new Set([
 const WRAPPER_TOOLS = SHELL_DEPENDENT_TOOLS;
 
 
-/** What a tool names its Skill tool, where not `Skill`; the dispatcher still routes it as Skill. */
-const SKILL_TOOL_MATCHER: Readonly<Record<string, string>> = { copilot: 'skill', [MUSE_TOOL_ID]: 'read_skill' };
+/** What a tool names its Skill tool, where not `Skill`; dispatcher still uses --matcher Skill. Cursor loads skills via Read of SKILL.md (#1156). */
+const SKILL_TOOL_MATCHER: Readonly<Record<string, string>> = { cursor: 'Read', copilot: 'skill', [MUSE_TOOL_ID]: 'read_skill' };
 
 export function builtinHookDefs(tool: string): HookDef[] {
   // ZCode renders per-event timeouts from the ZCODE_TIMEOUT_MS table in its own

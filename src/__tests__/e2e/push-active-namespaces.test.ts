@@ -3,7 +3,7 @@
  * and a local bare team repo. Destinations are read from the branch that
  * reached the remote, not from CLI output alone.
  */
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -91,8 +91,16 @@ function pushedFiles(): string[] {
   return branches.flatMap((branch) => git(['diff', '--name-only', 'main', branch], origin).split('\n').filter(Boolean));
 }
 
-beforeEach(() => {
-  sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-push-active-ns-'));
+// Every test starts from the same pulled project. It is set up and pulled
+// once, then copied back to the same path before each test: the paths the
+// pull recorded (config, state, git worktrees) stay valid in every copy.
+let fixtureRoot: string;
+let template: string;
+
+beforeAll(() => {
+  fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-push-active-ns-'));
+  sandbox = path.join(fixtureRoot, 'sandbox');
+  template = path.join(fixtureRoot, 'template');
   const home = path.join(sandbox, 'home');
   const seed = path.join(sandbox, 'seed');
   project = path.join(sandbox, 'project');
@@ -135,9 +143,16 @@ beforeEach(() => {
   }));
   const pulled = run(['pull']);
   expect(pulled.code, pulled.output).toBe(0);
+  fs.renameSync(sandbox, template);
+});
+
+beforeEach(() => {
+  fs.cpSync(template, sandbox, { recursive: true, preserveTimestamps: true, verbatimSymlinks: true });
 });
 
 afterEach(() => fs.rmSync(sandbox, { recursive: true, force: true }));
+
+afterAll(() => fs.rmSync(fixtureRoot, { recursive: true, force: true }));
 
 describe('push an edit of a skill pull kept after a project switch (#1020)', () => {
   it('pushes two tool edits to their distinct delivered destinations', () => {
@@ -392,11 +407,39 @@ describe('push an edit of a skill pull kept after a project switch (#1020)', () 
     expect(pushedFiles()).toEqual([]);
   });
 
-  it('leaves out a member\'s own skill that only shares its name with an inactive namespace', () => {
+  const ownSkillNamedLikeInactive = [
+    { scope: 'an active project', holders: 'skills/svc-b/b-skill', configure: () => {} },
+    {
+      scope: 'an active project, two inactive namespaces holding the name',
+      holders: 'skills/platform/b-skill, skills/svc-b/b-skill',
+      configure: () => commitOnTeam('skills/platform/b-skill/SKILL.md', skillMd('b-skill')),
+    },
+    { scope: 'no role and no active project', holders: 'skills/svc-b/b-skill', configure: () => setConfig({ projects: [] }) },
+    {
+      scope: 'a role with no skills namespace and no active project',
+      holders: 'skills/svc-b/b-skill',
+      configure: () => {
+        commitOnTeam('manifest/roles.yaml', YAML.stringify({
+          version: 1,
+          roles: [{ id: 'reviewer', description: 'reviewer', resources: { knowledge: [], skills: [], agents: [] } }],
+        }));
+        setConfig({ projects: [], primaryRole: 'reviewer' });
+      },
+    },
+  ];
+
+  it.each(ownSkillNamedLikeInactive)('leaves out a member\'s own skill named like an inactive namespace\'s, and says why, with $scope', ({ holders, configure }) => {
+    configure();
+    expect(run(['pull']).code).toBe(0);
     writeFile(path.join(project, '.claude', 'skills', 'b-skill', 'SKILL.md'), skillMd('b-skill') + '\nMy own.\n');
 
     const pushed = run(['push', '--all']);
 
+    expect(pushed.code, pushed.output).toBe(0);
+    expect(pushed.output).toContain(
+      `[skills] Skipped b-skill: the team keeps a skill of this name only outside your active namespaces (${holders}). `
+      + 'Rename yours to share it, or run `teamai projects set <id>` or `teamai roles set <role>` if it is that skill.',
+    );
     expect(pushed.output).toContain('No new or modified resources to push');
     expect(pushedFiles()).toEqual([]);
   });
@@ -931,7 +974,13 @@ describe('push --skill refuses a copy its record does not tie to a team skill', 
 
     expect(pushed.code, pushed.output).toBe(2);
     expect(pushed.output).toContain('no record of delivering this copy from skills/svc-b/b-skill');
+    expect(pushed.output).not.toContain('Skipped b-skill');
     expect(pushedFiles()).toEqual([]);
+
+    const named = run(['push', '--all', '--skill', path.join(project, '.claude', 'skills', 'b-skill'), '--role', 'svc-b']);
+
+    expect(named.output).not.toContain('Skipped b-skill');
+    expect(pushedFiles(), named.output).toEqual(expect.arrayContaining(['skills/svc-b/b-skill/SKILL.md']));
   });
 
   it('does not overwrite a skill recreated after a merge deletion', () => {

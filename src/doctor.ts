@@ -1,6 +1,7 @@
 import path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { detectProjectConfig, loadLocalConfig, loadTeamConfig } from './config.js';
+import { readWorkspaceChildren } from './workspace-children.js';
 import { pathExists, readFileSafe } from './utils/fs.js';
 import { log, setStderrOnly } from './utils/logger.js';
 import type { GlobalOptions } from './types.js';
@@ -21,6 +22,7 @@ import {
   isUsageReportEnabled,
   type LocalConfig,
   type TeamaiConfig,
+  installScopeName,
 } from './types.js';
 import { isToolInstalledForConfig } from './resources/base.js';
 import { skillsDirForTool } from './resources/skills.js';
@@ -39,6 +41,7 @@ import {
   buildCodexProjectTrustCheck,
   buildMcpGitExcludeCheck,
   buildEnvDeliveryCheck,
+  envLoaderNotes,
   buildEntryResolutionChecks,
   buildSecretValuesCheck,
   buildEntryScopeKeyCheck,
@@ -61,7 +64,8 @@ import {
 export type CheckSource = 'local' | 'provider';
 import { hasPiHooks } from './pi-hooks.js';
 import { describeEnvAdvisory, envAdvisories } from './env-advisories.js';
-import { resolveTeamEnv, type TeamEnv } from './env-resolution.js';
+import { resolvesTeamEnv, resolveTeamEnv, type TeamEnv } from './env-resolution.js';
+import type { GitContext } from './git-exclude.js';
 
 export interface Check {
   name: string;
@@ -111,6 +115,8 @@ export interface DoctorContext {
   baseDir: string;
   /** This scope's env, resolved once for every check that reads it (env-resolution.ts); none in HTTP mode. */
   teamEnv?: TeamEnv;
+  /** What git said of directories earlier in the same run (a pull's git exclude sync); the checks ask it first. */
+  gitContext?: GitContext;
 }
 
 export interface DoctorOptions extends GlobalOptions {
@@ -193,7 +199,7 @@ async function buildEnabledToolChecks(ctx: DoctorContext): Promise<Check[]> {
       check: isInstalled,
       fix: `enabledAgents lists ${tool}, but it has no directory under `
         + `${resolveToolBaseDir(tool, localConfig)}, so a pull delivers nothing to it. `
-        + `Install ${tool} (in project scope, opening a session there creates its root), `
+        + `Install ${tool} (in workspace scope, opening a session there creates its root), `
         + `or run \`teamai uninstall --agent ${tool}\` to stop syncing to it.`,
     });
   }
@@ -425,10 +431,11 @@ async function codexHookTrust(ctx: DoctorContext): Promise<{ checks: Check[]; no
  * Resolve the local/team configuration the checks run against. Returns null
  * when TeamAI is not initialized here — the caller decides how to report that.
  */
-export async function resolveDoctorContext(): Promise<DoctorContext | null> {
+export async function resolveDoctorContext(options: { gitContext?: GitContext } = {}): Promise<DoctorContext | null> {
   // Read-only: the load never persists a migration (#893).
   const projectConfig = await detectProjectConfig(undefined, undefined, { dryRun: true });
-  const localConfig = projectConfig ?? (await loadLocalConfig({ dryRun: true }));
+  // A workspace is checked with what it delivers: its own selection and its children's (#913).
+  const localConfig = projectConfig ? await readWorkspaceChildren(projectConfig) : await loadLocalConfig({ dryRun: true });
   if (!localConfig) return null;
 
   const teamConfig = await loadTeamConfig(localConfig.repo.localPath);
@@ -452,9 +459,9 @@ export async function resolveDoctorContext(): Promise<DoctorContext | null> {
     )
     : {};
   const baseDir = hookScope.baseDir;
-  const teamEnv = localConfig.repo.kind === 'http' ? undefined : await resolveTeamEnv(localConfig);
+  const teamEnv = resolvesTeamEnv(localConfig) ? await resolveTeamEnv(localConfig) : undefined;
 
-  return { localConfig, teamConfig, toolPaths, hookToolPaths, baseDir, teamEnv };
+  return { localConfig, teamConfig, toolPaths, hookToolPaths, baseDir, teamEnv, gitContext: options.gitContext };
 }
 
 /**
@@ -596,6 +603,7 @@ export async function buildChecks(ctx: DoctorContext, stage: CheckStage = 'docto
       fix: 'Run `teamai doctor --fix` to remove them. They are reclaimed anyway the '
         + 'next time the same lock is taken; removing them only clears the noise.',
     },
+    ...buildWorkspaceChildrenChecks(localConfig),
     ...await buildGitHookChecks(localConfig, stage),
     ...await buildTrackedHookIndexCheck(localConfig),
     ...buildToolRootChecks(localConfig, teamConfig),
@@ -623,6 +631,24 @@ export async function buildChecks(ctx: DoctorContext, stage: CheckStage = 'docto
   );
 
   return checks;
+}
+
+/**
+ * A workspace with children (#913): every folder set up under it is read, or
+ * the ones left out are named with what to do. None for a scope without
+ * children.
+ */
+function buildWorkspaceChildrenChecks(localConfig: LocalConfig): Check[] {
+  const found = localConfig.children;
+  if (!found) return [];
+  return [{
+    name: 'The workspace reads every child set up under it',
+    source: 'local',
+    reportedByPull: 'workspace-children',
+    check: async () => found.leftOut.length === 0,
+    fix: `${found.leftOut.map((child) => `${child.path} is left out: ${child.reason}`).join('; ')}. `
+      + 'Set each one up with this workspace\'s team repo (`teamai init <team repo>` there) to include it.',
+  }];
 }
 
 /**
@@ -755,7 +781,7 @@ export async function doctor(options: DoctorOptions): Promise<boolean> {
   const { localConfig } = ctx;
   const scope = localConfig.scope ?? 'user';
   if (!jsonMode) {
-    const scopeLabel = `${scope}${scope === 'project' && localConfig.projectRoot ? ` (${localConfig.projectRoot})` : ''}`;
+    const scopeLabel = `${installScopeName(scope)}${scope === 'project' && localConfig.projectRoot ? ` (${localConfig.projectRoot})` : ''}`;
     console.log(`  Scope: ${scopeLabel}\n`);
   }
 
@@ -793,6 +819,7 @@ export async function doctor(options: DoctorOptions): Promise<boolean> {
     ...(await envAdvisories(localConfig, ctx.teamConfig, ctx.teamEnv)).map(describeEnvAdvisory),
     // A team MCP server a tool cannot use over its transport.
     ...await mcpTransportNotes(ctx),
+    ...await envLoaderNotes(ctx),
     ...await ruleChannelNotes(localConfig),
     ...codexTrust.notes,
     usageReportNote(ctx),

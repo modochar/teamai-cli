@@ -66,8 +66,8 @@ repo:
   remote: https://github.com/your-org/your-repo.git
 username: your-name
 updatePolicy: auto             # auto, prompt, or skip
-scope: project                 # project (default from init) or user
-projectRoot: /path/to/project
+scope: workspace               # workspace (default from init) or user; project is read as workspace
+projectRoot: /path/to/my-workspace
 inheritUserScope: true
 coAuthorEnabled: true
 gitExcludeEnabled: true
@@ -78,6 +78,8 @@ toolRoots:
   claude: ~/.claude-work
   codex: ~/.codex-alt
 ```
+
+The role, project and tag fields hold this directory's own selection. A workspace also delivers the selections of the repos set up inside it, read at each pull and never written here. See [Workspaces with repos inside](./distribution.md#workspaces-with-repos-inside).
 
 #### Relocated tool roots (`toolRoots`)
 

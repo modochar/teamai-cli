@@ -98,6 +98,8 @@ teamai init your-org/your-repo
 
 The token needs the `repo` scope. `GH_TOKEN` is recognized as an alias.
 
+When MR/PR import falls back to the GitHub REST API, a failed metadata, commits, or diff request reports its HTTP status and response body before AI extraction. Check the PR's visibility, credentials, or rate limit before retrying.
+
 ### Default branch
 
 TeamAI detects the default branch with `getDefaultBranch()`: `origin/HEAD` first, then `origin/main` and `origin/master`. Both `main` and `master` work; no repository setting needs to change.
@@ -176,7 +178,7 @@ export GITLAB_API_PREFIX=api/v4                  # API path prefix; default api/
 
 Three names are accepted for the token, in priority order: `GITLAB_TOKEN` > `GITLAB_PRIVATE_TOKEN` > `GITLAB_PAT`. An empty or whitespace-only value counts as unset and the next alias is tried.
 
-`GITLAB_URL` **must carry a scheme** (`https://` or `http://`). `gitlab.example.com` on its own makes GitLab operations exit with an error instead of silently falling back to gitlab.com. Intranet http instances, non-standard ports and sub-path deployments (`https://example.com/gitlab`) are preserved in full, clone URLs included.
+`GITLAB_URL` **must carry a scheme** (`https://` or `http://`). `gitlab.example.com` on its own makes GitLab operations exit with an error instead of silently falling back to gitlab.com. Intranet http instances, non-standard ports and sub-path deployments (`https://example.com/gitlab`) are preserved in full, clone URLs included. MR import also preserves this deployment prefix in API requests and leaves it out of the project id; the MR URL must belong to that instance path.
 
 `GITLAB_API_PREFIX` is for gateway setups where the GitLab API is mounted on a non-standard path (`/api/gitlab` instead of `/api/v4`). It also applies to the group repository listing used by `teamai import --from-org`, every page included; unset or empty, `api/v4` is used. Setting it avoids 405 errors in those setups. Examples:
 

@@ -19,7 +19,9 @@ import {
 } from './namespaced-entries.js';
 import type { GlobalOptions, LocalConfig } from './types.js';
 import { isSelfMode } from './types.js';
+import { isReservedTeamEnvKey, reservedTeamEnvWarning } from './env-reserved.js';
 import { reconcileMcpForConfig } from './mcp-reconcile.js';
+import { readWorkspaceChildren } from './workspace-children.js';
 
 const envHandler = new EnvHandler();
 
@@ -34,6 +36,11 @@ export async function envList(options: GlobalOptions & { reveal?: boolean }): Pr
   const localConfig = await requireScope(true);
   if (!localConfig) return;
   const teamEnv = await resolveTeamEnv(localConfig);
+  const reservedWarning = reservedTeamEnvWarning([
+    ...(teamEnv.variables.kind === 'resolved' ? teamEnv.variables.entries.map(({ name }) => name) : []),
+    ...(declaredSecretKeys(teamEnv.declarations) ?? []),
+  ]);
+  if (reservedWarning) log.warn(reservedWarning);
   // An entry an unknown or removed key takes out of the delivered set never
   // appears in the list below, so say why it is missing (#822).
   reportUndeliveredEntryNotices(teamEnv.variables);
@@ -68,6 +75,9 @@ export async function envSet(
   // Stored under the name the scope declares, which on Windows may differ in case from the one typed.
   let key = typed;
   if (!ENV_KEY_RE.test(key)) return fail(invalidKeyMessage(key));
+  if (isReservedTeamEnvKey(key)) {
+    log.warn(reservedTeamEnvWarning([key])!);
+  }
   if (options.stdin && options.fromEnv !== undefined) return fail('Pass either --stdin or --from-env, not both. Nothing was changed.');
   if (options.fromEnv !== undefined && !ENV_KEY_RE.test(options.fromEnv)) {
     return fail(invalidKeyMessage(options.fromEnv, '--from-env variable name'));
@@ -212,7 +222,8 @@ async function scopeHere(
     fail(`Cannot tell which team this directory belongs to: ${describeUnreadableConfig(problem)}`);
     return { kind: 'reported' };
   }
-  if (projectConfig) return { kind: 'scope', localConfig: projectConfig };
+  // A workspace's env includes its children's, as pull delivers it (#913).
+  if (projectConfig) return { kind: 'scope', localConfig: await readWorkspaceChildren(projectConfig) };
   try {
     return { kind: 'scope', localConfig: (await requireInit({ dryRun })).localConfig };
   } catch (e) {

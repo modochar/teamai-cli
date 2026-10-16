@@ -129,7 +129,8 @@ describe('source freshness on codebase recall (real CLI)', () => {
       throw new Error(`TeamAI CLI not found at ${CLI}. Run "npm run build" first.`);
     }
 
-    sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-source-freshness-e2e-'));
+    // Real path: git reports the canonical toplevel (/private/var on macOS).
+    sandbox = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-source-freshness-e2e-')));
     sourceRepo = path.join(sandbox, 'source-repo');
     homeDir = path.join(sandbox, 'home');
     authPath = path.join(sourceRepo, 'src', 'auth.ts');
@@ -156,14 +157,16 @@ describe('source freshness on codebase recall (real CLI)', () => {
     git(['commit', '-m', 'baseline source snapshot'], sourceRepo);
     writeLocalConfig(homeDir, sourceRepo);
 
+    // The configured team repo is the source repo itself, so this is its teamwiki/.
     const extracted = await runCLI(
-      ['codebase', '--extract', sourceRepo, '--project', 'freshness-demo', '--json', '--max-files', '10'],
+      ['import', '--dir', sourceRepo, '--output', sourceRepo, '--skip-enrich'],
       homeDir,
       sourceRepo,
     );
     expect(extracted.code, extracted.output).toBe(0);
 
-    const sourceManifestPath = path.join(teamwiki, 'evidence', 'code', 'freshness-demo', 'source-manifest.json');
+    // A checkout's root takes the repo's name as its slug.
+    const sourceManifestPath = path.join(teamwiki, 'evidence', 'code', 'source-repo', 'source-manifest.json');
     expect(fs.existsSync(sourceManifestPath), extracted.output).toBe(true);
     const sourceManifest = JSON.parse(fs.readFileSync(sourceManifestPath, 'utf8')) as {
       project?: string;
@@ -171,7 +174,7 @@ describe('source freshness on codebase recall (real CLI)', () => {
       sourceSubdir?: string;
       files?: Array<{ relativePath?: string; sha256?: string }>;
     };
-    expect(sourceManifest.project).toBe('freshness-demo');
+    expect(sourceManifest.project).toBe('source-repo');
     expect(sourceManifest.repoIdentity).toContain('source.example.invalid');
     expect(sourceManifest.sourceSubdir).toBe('');
     expect(sourceManifest.files).toContainEqual(expect.objectContaining({
